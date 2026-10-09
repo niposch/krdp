@@ -62,7 +62,7 @@ Wayland payload from a clipboard-change handler.
 
 ## Validation and operation
 
-All 15 CTest entries pass (14 functional checks; appstream skips before install),
+All 16 CTest entries pass (15 functional checks; appstream skips before install),
 including non-tile-aligned progressive codec round trips and monitor-specific
 damage preservation. Clipboard snapshot negative/positive regression checks pass.
 A synthetic loopback RDP server and FreeRDP client on an isolated X display decode
@@ -77,3 +77,18 @@ The prior 09:41 trial confirmed two Windows screens and pointer movement.
 Post-merge Windows color/capture, local takeover and natural resume still need
 checking. No beta Plasma/input dependency is adopted; KDE master additionally
 requires libei >=1.6 and needs a separate future migration.
+
+## Network estimate correction
+
+FreeRDP 3.31.1 delivers bandwidth byte/time results to our callback without
+populating `netCharBandwidth`. The inherited unsigned, uninitialized last-value
+check could advertise arbitrary/zero bandwidth before a real sample. Compute
+wire kilobits/s directly using 64-bit arithmetic, publish only after a valid
+sample, and retain the connection's highest observed goodput as a lower-bound
+estimate so an idle desktop does not lower the reported link estimate. This is
+observed session throughput, not a capacity speed test. Adaptive quality still
+uses the separate smoothed recent goodput. Scheduling runs on the peer thread
+for both codecs; progressive frame sends no longer race/shorten these windows.
+Missing-result recovery and 16-bit RTT sequence wrap are handled. Synthetic
+protocol tests cover startup, FreeRDP's zero field, unit conversion, idle windows,
+overflow and sequence wrap. Reconnect Windows to refresh its cached estimate.

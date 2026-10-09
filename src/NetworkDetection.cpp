@@ -30,10 +30,8 @@ constexpr auto rttUpdateInterval = clk::milliseconds(70);
 constexpr auto rttAverageInterval = clk::milliseconds(500);
 constexpr auto networkResultInterval = clk::seconds(1);
 constexpr double bandwidthSmoothingWeight = 0.5;
-// Goodput is measured over a scheduled window rather than bracketed around a
-// single frame send: a single frame is far too short a sample (a few hundred
-// bytes over ~1 ms reads as either near-zero or many-hundred-Mbit/s goodput,
-// see research.md OPT-016). Matches upstream krdp's NetworkDetection.
+// Measure real traffic over a scheduled window, on the peer thread only.
+// Per-frame windows are too short to produce meaningful goodput estimates.
 constexpr auto bandwidthMeasureDuration = clk::milliseconds(500);
 constexpr auto bandwidthMeasureInterval = clk::seconds(2);
 // A sample shorter than this or carrying fewer bytes than this is too noisy
@@ -67,25 +65,25 @@ struct RTTMeasurement {
 class NetworkDetection::Private
 {
 public:
-    uint32_t nextSequenceNumber();
+    uint16_t nextSequenceNumber();
 
     RdpConnection *session = nullptr;
     rdpAutoDetect *rdpAutodetect = nullptr;
 
     State state = State::None;
 
-    uint32_t sequenceNumber = 0;
+    uint16_t sequenceNumber = 0;
 
-    uint32_t lastBandwithMeasurement;
+    // Highest observed goodput is a lower bound on available bandwidth. Idle
+    // desktop traffic must not overwrite it with the application's low demand.
+    uint32_t reportedBandwidthKbps = 0;
 
     double smoothedBandwidthBps = 0.0;
     bool hasSmoothedBandwidth = false;
     std::atomic<uint32_t> averageBandwidthBps{0};
     std::atomic<int> validSamples{0};
 
-    // Bandwidth measurement scheduling (mirrors upstream krdp's
-    // NetworkDetection::update()): a bandwidthMeasureDuration-long window is
-    // opened every bandwidthMeasureInterval while idle.
+    // Scheduled measurement and request timeout bookkeeping.
     clk::system_clock::time_point bandwidthMeasureStartTime;
     clk::system_clock::time_point lastBandwidthMeasureStart;
 
@@ -146,7 +144,9 @@ void NetworkDetection::startBandwidthMeasure()
 
     d->state = State::PendingStop;
     d->bandwidthMeasureStartTime = clk::system_clock::now();
-    d->rdpAutodetect->BandwidthMeasureStart(d->rdpAutodetect, RDP_TRANSPORT_TCP, 0);
+    if (!d->rdpAutodetect->BandwidthMeasureStart(d->rdpAutodetect, RDP_TRANSPORT_TCP, 0)) {
+        d->state = State::None;
+    }
 }
 
 void NetworkDetection::stopBandwidthMeasure()
@@ -156,7 +156,9 @@ void NetworkDetection::stopBandwidthMeasure()
     }
 
     d->state = State::PendingResults;
-    d->rdpAutodetect->BandwidthMeasureStop(d->rdpAutodetect, RDP_TRANSPORT_TCP, 0, 0);
+    if (!d->rdpAutodetect->BandwidthMeasureStop(d->rdpAutodetect, RDP_TRANSPORT_TCP, 0, 0)) {
+        d->state = State::None;
+    }
 }
 
 void NetworkDetection::update()
@@ -166,6 +168,11 @@ void NetworkDetection::update()
     }
 
     auto now = clk::system_clock::now();
+
+    // Do not let a missing bandwidth response stall measurement forever.
+    if (d->state == State::PendingResults && now - d->bandwidthMeasureStartTime > clk::seconds(5)) {
+        d->state = State::None;
+    }
 
     // Goodput: run a bandwidthMeasureDuration-long window every
     // bandwidthMeasureInterval, independent of frame sends (a single frame is
@@ -229,7 +236,8 @@ bool NetworkDetection::onBandwidthMeasureResults(uint32_t timeDelta, uint32_t by
         return true;
     }
 
-    const auto bytesPerSecond = static_cast<uint32_t>((static_cast<uint64_t>(byteCount) * 1000ULL) / static_cast<uint64_t>(timeDelta));
+    const auto bytesPerSecond = static_cast<uint32_t>(std::min<uint64_t>(
+        static_cast<uint64_t>(byteCount) * 1000ULL / timeDelta, std::numeric_limits<uint32_t>::max()));
     if (!d->hasSmoothedBandwidth) {
         d->hasSmoothedBandwidth = true;
         d->smoothedBandwidthBps = bytesPerSecond;
@@ -242,11 +250,13 @@ bool NetworkDetection::onBandwidthMeasureResults(uint32_t timeDelta, uint32_t by
 
     qCDebug(KRDP) << "Bandwidth measurement:" << byteCount << "bytes in" << timeDelta << "ms ->" << bandwidth() << "kbit/s";
 
-    if (d->rdpAutodetect->netCharBandwidth <= 0) {
-        return true;
+    // FreeRDP 3.31 invokes our callback with byteCount/timeDelta; it does not
+    // populate netCharBandwidth. The wire value is kilobits/s, not bytes/s.
+    const auto measuredKbps = static_cast<uint32_t>(static_cast<uint64_t>(byteCount) * 8 / timeDelta);
+    if (measuredKbps > static_cast<uint64_t>(d->reportedBandwidthKbps) * 5 / 4) {
+        qCInfo(KRDP) << "Observed network throughput:" << measuredKbps << "kbit/s";
     }
-
-    d->lastBandwithMeasurement = d->rdpAutodetect->netCharBandwidth;
+    d->reportedBandwidthKbps = std::max(d->reportedBandwidthKbps, measuredKbps);
 
     updateAverageRtt();
 
@@ -276,7 +286,7 @@ void NetworkDetection::updateAverageRtt()
 
     Q_EMIT rttChanged();
 
-    if (d->lastBandwithMeasurement < 0) {
+    if (d->reportedBandwidthKbps == 0) {
         return;
     }
 
@@ -286,21 +296,22 @@ void NetworkDetection::updateAverageRtt()
 
     d->lastNetworkResult = now;
 
-    rdpNetworkCharacteristicsResult result;
+    rdpNetworkCharacteristicsResult result{};
     result.type = RDP_NETCHAR_RESULT_TYPE_BASE_RTT_BW_AVG_RTT;
     result.baseRTT = clk::duration_cast<clk::milliseconds>(d->minimumRtt).count();
     result.averageRTT = clk::duration_cast<clk::milliseconds>(d->averageRtt).count();
-    result.bandwidth = d->lastBandwithMeasurement;
+    result.bandwidth = d->reportedBandwidthKbps;
+    qCDebug(KRDP) << "Reporting observed bandwidth:" << result.bandwidth << "kbit/s";
     d->rdpAutodetect->NetworkCharacteristicsResult(d->rdpAutodetect, RDP_TRANSPORT_TCP, d->nextSequenceNumber(), &result);
 }
 
-uint32_t NetworkDetection::Private::nextSequenceNumber()
+uint16_t NetworkDetection::Private::nextSequenceNumber()
 {
-    auto sequence = sequenceNumber;
+    uint16_t sequence = sequenceNumber;
     while (sequence == 0 || rttRequests.contains(sequence)) {
         ++sequence;
     }
-    sequenceNumber = sequence + 1;
+    sequenceNumber = static_cast<uint16_t>(sequence + 1);
     return sequence;
 }
 

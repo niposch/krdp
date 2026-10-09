@@ -1216,7 +1216,6 @@ bool VideoStream::sendRasterFrame(const VideoFrame &frame, uint16_t surfaceId, c
         return true;
     }
 
-    d->session->networkDetection()->startBandwidthMeasure();
 
     auto frameId = d->frameId++;
 
@@ -1258,7 +1257,6 @@ bool VideoStream::sendRasterFrame(const VideoFrame &frame, uint16_t surfaceId, c
                         << "damageRects" << rectCount;
     }
 
-    d->session->networkDetection()->stopBandwidthMeasure();
     region16_uninit(&*invalidRegion);
     return true;
 }

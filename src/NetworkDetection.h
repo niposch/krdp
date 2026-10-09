@@ -63,6 +63,7 @@ public:
     void update();
 
 private:
+    friend class NetworkDetectionTest;
     friend BOOL rttMeasureResponse(rdpAutoDetect *, RDP_TRANSPORT_TYPE, uint16_t);
     friend BOOL bwMeasureResults(rdpAutoDetect *, RDP_TRANSPORT_TYPE, uint16_t, uint16_t, uint32_t, uint32_t);
 

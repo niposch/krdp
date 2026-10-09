@@ -87,3 +87,14 @@ add_test(NAME ProgressiveCodecTest COMMAND ProgressiveCodecTest)
 add_executable(krdp-synthetic-video-server SyntheticVideoServer.cpp)
 target_include_directories(krdp-synthetic-video-server PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/src)
 target_link_libraries(krdp-synthetic-video-server PRIVATE Qt6::Gui KRdp)
+
+# Include the real implementation so the fixture can inspect private protocol
+# state; explicit moc generation avoids compiling it twice.
+add_executable(NetworkDetectionTest NetworkDetectionTest.cpp)
+qt6_wrap_cpp(network_moc ${CMAKE_SOURCE_DIR}/src/NetworkDetection.h NetworkDetectionTest.cpp TARGET NetworkDetectionTest)
+set_source_files_properties(${network_moc} PROPERTIES HEADER_FILE_ONLY TRUE)
+set_target_properties(NetworkDetectionTest PROPERTIES AUTOMOC OFF)
+target_include_directories(NetworkDetectionTest PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/src ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_BINARY_DIR}/__/src)
+target_include_directories(NetworkDetectionTest SYSTEM PRIVATE ${FreeRDP_INCLUDE_DIR} ${WinPR_INCLUDE_DIR})
+target_link_libraries(NetworkDetectionTest PRIVATE Qt6::Test Qt6::Core)
+add_test(NAME NetworkDetectionTest COMMAND NetworkDetectionTest)
