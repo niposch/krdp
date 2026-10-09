@@ -383,14 +383,13 @@ PlasmaScreencastV1Session::PlasmaScreencastV1Session()
             return;
         }
 
-        // KSystemClipboard takes ownership of any QMimeData passed to it but
-        // does not relinquish ownership over anything it returns. So manually
-        // copy over the contents to a new instance of QMimeData so we can keep
-        // the semantics the same.
-        auto newData = new QMimeData();
+        // Keep an owned snapshot, but only fetch the text that cliprdr sends.
+        // Eagerly reading every Wayland MIME payload blocks the main thread
+        // on image conversions and unavailable formats (KDE bug 520175).
         const auto formats = data->formats();
-        for (auto format : formats) {
-            newData->setData(format, data->data(format));
+        auto newData = new QMimeData();
+        if (data->hasText()) {
+            newData->setText(data->text());
         }
 
         qCDebug(KRDP) << "Announcing system clipboard change to the client, formats:" << formats;

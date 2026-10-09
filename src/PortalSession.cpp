@@ -166,14 +166,12 @@ PortalSession::PortalSession()
             return;
         }
 
-        // KSystemClipboard takes ownership of any QMimeData passed to it but
-        // does not relinquish ownership over anything it returns. So manually
-        // copy over the contents to a new instance of QMimeData so we can keep
-        // the semantics the same.
+        // Keep an owned snapshot, but only fetch the text that cliprdr sends.
+        // Eagerly reading every Wayland MIME payload blocks the main thread
+        // on image conversions and unavailable formats (KDE bug 520175).
         auto newData = new QMimeData();
-        const auto formats = data->formats();
-        for (auto format : formats) {
-            newData->setData(format, data->data(format));
+        if (data->hasText()) {
+            newData->setText(data->text());
         }
 
         Q_EMIT clipboardDataChanged(newData);
