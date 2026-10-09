@@ -67,10 +67,9 @@ FREERDP_AUTODETECT_STATE progressNetworkProbe(rdpAutoDetect *autodetect)
     return reinterpret_cast<PeerContext *>(autodetect->context)->networkDetection->progressConnectTimeProbe();
 }
 
-BOOL netCharSync(rdpAutoDetect *autodetect, RDP_TRANSPORT_TYPE, uint16_t sequence, uint32_t, uint32_t)
+BOOL netCharSync(rdpAutoDetect *autodetect, RDP_TRANSPORT_TYPE, uint16_t, uint32_t bandwidth, uint32_t rtt)
 {
-    // Auto-reconnect may answer an RTT request with NETCHAR_SYNC instead.
-    return reinterpret_cast<PeerContext *>(autodetect->context)->networkDetection->onRttMeasureResponse(sequence);
+    return reinterpret_cast<PeerContext *>(autodetect->context)->networkDetection->onNetworkCharacteristicsSync(bandwidth, rtt);
 }
 
 struct RTTMeasurement {
@@ -160,10 +159,27 @@ void NetworkDetection::initialize()
     d->rdpAutodetect->RTTMeasureResponse = rttMeasureResponse;
     d->rdpAutodetect->BandwidthMeasureResults = bwMeasureResults;
     d->rdpAutodetect->NetworkCharacteristicsSync = netCharSync;
-    if (!qEnvironmentVariableIsSet("KRDP_NO_BANDWIDTH_PROBE")) {
+    // Experimental until Windows interoperability is validated. Default builds
+    // retain the working passive reporting path.
+    if (qEnvironmentVariableIntValue("KRDP_BANDWIDTH_PROBE") == 1) {
         d->rdpAutodetect->OnConnectTimeAutoDetectBegin = beginNetworkProbe;
         d->rdpAutodetect->OnConnectTimeAutoDetectProgress = progressNetworkProbe;
     }
+}
+
+bool NetworkDetection::onNetworkCharacteristicsSync(uint32_t bandwidth, uint32_t rtt)
+{
+    // MS-RDPBCGR 3.3.5.14: cached reconnect metrics MUST stop every measurement.
+    d->probeStage = Private::ProbeStage::Complete;
+    d->state = State::None;
+    d->rttRequests.clear();
+    d->rttMeasurements.clear();
+    d->rttMeasurements.push_back({clk::system_clock::now(), clk::milliseconds(rtt)});
+    d->reportedBandwidthKbps = bandwidth;
+    d->hasProbedBandwidth = false; // Passive observations may improve a stale cache.
+    updateAverageRtt();
+    qCInfo(KRDP) << "Client supplied cached network metrics:" << bandwidth << "kbit/s," << rtt << "ms; stopping probe";
+    return true;
 }
 
 // Connection-time payload PDUs are supported by the protocol/FreeRDP only
@@ -185,7 +201,11 @@ FREERDP_AUTODETECT_STATE NetworkDetection::beginConnectTimeProbe()
 
 bool NetworkDetection::sendProbeRound(uint32_t bytes)
 {
-    constexpr uint16_t chunkBytes = 16384;
+    // FreeRDP encodes MCS length with the two-octet PER form. Its decoder
+    // accepts 16-KiB payloads, but their length crosses the 14-bit limit and
+    // Windows interprets 0b11 as a fragmented determinant. Stay below it,
+    // including the security and bandwidth headers.
+    constexpr uint16_t chunkBytes = 8192;
     d->probeBytes = bytes;
     d->probeSequence = d->nextSequenceNumber();
     d->probeRoundComplete = false;
@@ -200,6 +220,7 @@ bool NetworkDetection::sendProbeRound(uint32_t bytes)
 
 FREERDP_AUTODETECT_STATE NetworkDetection::progressConnectTimeProbe()
 {
+    if (d->probeStage == Private::ProbeStage::Complete) return FREERDP_AUTODETECT_STATE_COMPLETE;
     if (d->probeStage == Private::ProbeStage::Rtt && !d->rttMeasurements.empty()) {
         return sendProbeRound(64 * 1024) ? FREERDP_AUTODETECT_STATE_REQUEST : FREERDP_AUTODETECT_STATE_FAIL;
     }

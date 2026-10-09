@@ -23,7 +23,8 @@ int main(int argc, char** argv)
         }
     }
     KRdp::Server server;
-    server.setAddress(QHostAddress::LocalHost);
+    const auto address = qEnvironmentVariable("KRDP_SYNTHETIC_ADDRESS");
+    server.setAddress(address.isEmpty() ? QHostAddress(QHostAddress::LocalHost) : QHostAddress(address));
     server.setPort(QString::fromLocal8Bit(argv[1]).toUShort());
     server.setTlsCertificate(argv[2]);
     server.setTlsCertificateKey(argv[3]);
@@ -54,6 +55,7 @@ int main(int argc, char** argv)
     });
     if (!server.start())
         return 3;
-    QTimer::singleShot(9000, &app, &QCoreApplication::quit);
+    const int seconds = qBound(9, qEnvironmentVariableIntValue("KRDP_SYNTHETIC_SECONDS"), 300);
+    QTimer::singleShot(seconds * 1000, &app, &QCoreApplication::quit);
     return app.exec();
 }

@@ -85,12 +85,19 @@ populating `netCharBandwidth`. The inherited unsigned, uninitialized last-value
 check could advertise arbitrary/zero bandwidth before a real sample. Compute
 wire kilobits/s directly using 64-bit arithmetic and publish only valid results.
 
-A real connection-time protocol probe measures bandwidth independently of screen
+An experimental connection-time protocol probe measures bandwidth independently of screen
 activity. After an RTT request, send random RDP bandwidth payloads: 64 KiB first,
 then 256 KiB and at most 1 MiB only when the prior round takes under 20 ms.
 Total payload is capped at 1.3125 MiB; no probe traffic continues during ordinary
 streaming. An eight-second handshake deadline closes an unresponsive peer;
-`KRDP_NO_BANDWIDTH_PROBE=1` opts out for an incompatible client. Clients without
+The probe is disabled by default: `KRDP_BANDWIDTH_PROBE=1` explicitly enables it.
+The first Windows trial failed with 0x1304 and was rolled back. The corrected
+8-KiB payload stays within PER's 14-bit unfragmented length form; Windows
+now completes real probe exchanges (~54–87 Mbit/s in the synthetic LAN test).
+The synthetic login then closed because no test password was entered. NETCHAR_SYNC
+now cancels probing and uses cached metrics as required by MS-RDPBCGR; this
+regression is tested. Normal-server login/display validation follows deployment.
+Clients without
 negotiated auto-detection skip it. Probe results are an estimate at connection
 start, not a guarantee of Wi-Fi/link capacity for the entire session. Reconnect
 to remeasure. The FreeRDP client wire test verifies actual payload/results and

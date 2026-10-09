@@ -74,6 +74,7 @@ private:
 
     bool onRttMeasureResponse(uint16_t sequence);
     bool onBandwidthMeasureResults(uint32_t timeDelta, uint32_t byteCount, uint16_t sequence = 0, uint16_t responseType = RDP_BW_RESULTS_RESPONSE_TYPE_CONTINUOUS);
+    bool onNetworkCharacteristicsSync(uint32_t bandwidth, uint32_t rtt);
     FREERDP_AUTODETECT_STATE beginConnectTimeProbe();
     FREERDP_AUTODETECT_STATE progressConnectTimeProbe();
     bool sendProbeRound(uint32_t bytes);
