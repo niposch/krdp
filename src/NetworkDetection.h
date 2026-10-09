@@ -10,6 +10,7 @@
 #include <QObject>
 
 #include <freerdp/freerdp.h>
+#include <freerdp/autodetect.h>
 #include <freerdp/types.h>
 
 namespace KRdp
@@ -61,14 +62,21 @@ public:
     void stopBandwidthMeasure();
 
     void update();
+    bool connectTimeProbeTimedOut() const;
 
 private:
     friend class NetworkDetectionTest;
     friend BOOL rttMeasureResponse(rdpAutoDetect *, RDP_TRANSPORT_TYPE, uint16_t);
+    friend FREERDP_AUTODETECT_STATE beginNetworkProbe(rdpAutoDetect *);
+    friend FREERDP_AUTODETECT_STATE progressNetworkProbe(rdpAutoDetect *);
+    friend BOOL netCharSync(rdpAutoDetect *, RDP_TRANSPORT_TYPE, uint16_t, uint32_t, uint32_t);
     friend BOOL bwMeasureResults(rdpAutoDetect *, RDP_TRANSPORT_TYPE, uint16_t, uint16_t, uint32_t, uint32_t);
 
     bool onRttMeasureResponse(uint16_t sequence);
-    bool onBandwidthMeasureResults(uint32_t timeDelta, uint32_t byteCount);
+    bool onBandwidthMeasureResults(uint32_t timeDelta, uint32_t byteCount, uint16_t sequence = 0, uint16_t responseType = RDP_BW_RESULTS_RESPONSE_TYPE_CONTINUOUS);
+    FREERDP_AUTODETECT_STATE beginConnectTimeProbe();
+    FREERDP_AUTODETECT_STATE progressConnectTimeProbe();
+    bool sendProbeRound(uint32_t bytes);
 
     void updateAverageRtt();
 

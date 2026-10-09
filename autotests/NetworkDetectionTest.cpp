@@ -16,6 +16,19 @@ static BOOL sendResult(rdpAutoDetect*, RDP_TRANSPORT_TYPE, uint16_t, const rdpNe
     ++results;
     return TRUE;
 }
+static uint32_t probeSent = 0;
+static BOOL probeRtt(rdpAutoDetect*, RDP_TRANSPORT_TYPE, uint16_t) { return TRUE; }
+static BOOL probeStart(rdpAutoDetect*, RDP_TRANSPORT_TYPE, uint16_t) { return TRUE; }
+static BOOL probePayload(rdpAutoDetect*, RDP_TRANSPORT_TYPE, uint16_t, uint16_t bytes)
+{
+    probeSent += bytes;
+    return TRUE;
+}
+static BOOL probeStop(rdpAutoDetect*, RDP_TRANSPORT_TYPE, uint16_t, uint16_t bytes)
+{
+    probeSent += bytes;
+    return TRUE;
+}
 class NetworkDetectionTest : public QObject {
     Q_OBJECT
 private Q_SLOTS:
@@ -59,6 +72,66 @@ private Q_SLOTS:
         sample(100, std::numeric_limits<uint32_t>::max());
         refreshRtt();
         QCOMPARE(reported, 343597383U); // 64-bit conversion before narrowing.
+    }
+    void activeProbe()
+    {
+        NetworkDetection network(nullptr);
+        rdpAutoDetect autodetect { };
+        autodetect.RTTMeasureRequest = probeRtt;
+        autodetect.BandwidthMeasureStart = probeStart;
+        autodetect.BandwidthMeasurePayload = probePayload;
+        autodetect.BandwidthMeasureStop = probeStop;
+        autodetect.NetworkCharacteristicsResult = sendResult;
+        network.d->rdpAutodetect = &autodetect;
+        probeSent = 0;
+        reported = 0;
+        results = 0;
+        QCOMPARE(network.beginConnectTimeProbe(), FREERDP_AUTODETECT_STATE_REQUEST);
+        network.d->rttMeasurements.push_back({ clk::system_clock::now() - clk::seconds(1), clk::milliseconds(4) });
+        QCOMPARE(network.progressConnectTimeProbe(), FREERDP_AUTODETECT_STATE_REQUEST);
+        QCOMPARE(probeSent, 65536U);
+        // Wrong sequence cannot advance the probe; zero-ms sample must grow.
+        network.onBandwidthMeasureResults(0, 65536, network.d->probeSequence + 1, RDP_BW_RESULTS_RESPONSE_TYPE_CONNECTTIME);
+        QCOMPARE(network.progressConnectTimeProbe(), FREERDP_AUTODETECT_STATE_REQUEST);
+        QCOMPARE(probeSent, 65536U);
+        network.onBandwidthMeasureResults(0, 65536, network.d->probeSequence, RDP_BW_RESULTS_RESPONSE_TYPE_CONNECTTIME);
+        QCOMPARE(network.progressConnectTimeProbe(), FREERDP_AUTODETECT_STATE_REQUEST);
+        QCOMPARE(probeSent, 65536U + 262144U);
+        network.onBandwidthMeasureResults(1, 262144, network.d->probeSequence, RDP_BW_RESULTS_RESPONSE_TYPE_CONNECTTIME);
+        QCOMPARE(network.progressConnectTimeProbe(), FREERDP_AUTODETECT_STATE_REQUEST);
+        QCOMPARE(probeSent, 65536U + 262144U + 1048576U);
+        network.onBandwidthMeasureResults(40, 1048576, network.d->probeSequence, RDP_BW_RESULTS_RESPONSE_TYPE_CONNECTTIME);
+        QCOMPARE(network.progressConnectTimeProbe(), FREERDP_AUTODETECT_STATE_COMPLETE);
+        QCOMPARE(reported, 209715U);
+        QVERIFY(network.d->hasProbedBandwidth);
+        // Probe capacity and application goodput are separate estimates.
+        network.d->state = NetworkDetection::State::PendingResults;
+        network.onBandwidthMeasureResults(500, 4096);
+        QCOMPARE(network.d->reportedBandwidthKbps, 209715U);
+        QCOMPARE(network.bandwidth(), 65U);
+        QVERIFY(!network.connectTimeProbeTimedOut());
+        network.d->probeStage = NetworkDetection::Private::ProbeStage::Rtt;
+        network.d->probeStarted = clk::steady_clock::now() - clk::seconds(9);
+        QVERIFY(network.connectTimeProbeTimedOut());
+    }
+    void slowProbe()
+    {
+        NetworkDetection network(nullptr);
+        rdpAutoDetect autodetect { };
+        autodetect.RTTMeasureRequest = probeRtt;
+        autodetect.BandwidthMeasureStart = probeStart;
+        autodetect.BandwidthMeasurePayload = probePayload;
+        autodetect.BandwidthMeasureStop = probeStop;
+        autodetect.NetworkCharacteristicsResult = sendResult;
+        network.d->rdpAutodetect = &autodetect;
+        probeSent = 0;
+        network.beginConnectTimeProbe();
+        network.d->rttMeasurements.push_back({ clk::system_clock::now(), clk::milliseconds(100) });
+        network.progressConnectTimeProbe();
+        network.onBandwidthMeasureResults(500, 65536, network.d->probeSequence, RDP_BW_RESULTS_RESPONSE_TYPE_CONNECTTIME);
+        QCOMPARE(network.progressConnectTimeProbe(), FREERDP_AUTODETECT_STATE_COMPLETE);
+        QCOMPARE(probeSent, 65536U);
+        QCOMPARE(network.d->reportedBandwidthKbps, 1048U);
     }
     void sequenceWrap()
     {

@@ -78,17 +78,28 @@ Post-merge Windows color/capture, local takeover and natural resume still need
 checking. No beta Plasma/input dependency is adopted; KDE master additionally
 requires libei >=1.6 and needs a separate future migration.
 
-## Network estimate correction
+## Network estimate correction and active probe
 
 FreeRDP 3.31.1 delivers bandwidth byte/time results to our callback without
 populating `netCharBandwidth`. The inherited unsigned, uninitialized last-value
 check could advertise arbitrary/zero bandwidth before a real sample. Compute
-wire kilobits/s directly using 64-bit arithmetic, publish only after a valid
-sample, and retain the connection's highest observed goodput as a lower-bound
-estimate so an idle desktop does not lower the reported link estimate. This is
-observed session throughput, not a capacity speed test. Adaptive quality still
-uses the separate smoothed recent goodput. Scheduling runs on the peer thread
-for both codecs; progressive frame sends no longer race/shorten these windows.
-Missing-result recovery and 16-bit RTT sequence wrap are handled. Synthetic
-protocol tests cover startup, FreeRDP's zero field, unit conversion, idle windows,
-overflow and sequence wrap. Reconnect Windows to refresh its cached estimate.
+wire kilobits/s directly using 64-bit arithmetic and publish only valid results.
+
+A real connection-time protocol probe measures bandwidth independently of screen
+activity. After an RTT request, send random RDP bandwidth payloads: 64 KiB first,
+then 256 KiB and at most 1 MiB only when the prior round takes under 20 ms.
+Total payload is capped at 1.3125 MiB; no probe traffic continues during ordinary
+streaming. An eight-second handshake deadline closes an unresponsive peer;
+`KRDP_NO_BANDWIDTH_PROBE=1` opts out for an incompatible client. Clients without
+negotiated auto-detection skip it. Probe results are an estimate at connection
+start, not a guarantee of Wi-Fi/link capacity for the entire session. Reconnect
+to remeasure. The FreeRDP client wire test verifies actual payload/results and
+both monitor surfaces, not just simulated arithmetic.
+
+Passive goodput remains separate for adaptive quality. A successful active probe
+sets the client-visible estimate; idle traffic cannot replace it with application
+demand. If the probe yields no usable result, retain the highest observed session
+goodput as a fallback lower bound. All continuous measurement scheduling runs on
+the peer thread, including progressive. Missing-result recovery and 16-bit RTT
+sequence wrap are handled. Regression tests cover startup, units, idle demand,
+byte limits, slow/zero-ms samples, sequences, deadline and overflow.

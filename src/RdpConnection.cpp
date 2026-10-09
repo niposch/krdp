@@ -638,7 +638,7 @@ void RdpConnection::initialize()
     freerdp_settings_set_bool(settings, FreeRDP_HasHorizontalWheel, true);
     freerdp_settings_set_bool(settings, FreeRDP_UnicodeInput, true);
 
-    // TODO: Implement network performance detection
+    // Connection-time capacity probe plus continuous RTT/goodput detection.
     freerdp_settings_set_bool(settings, FreeRDP_NetworkAutoDetect, true);
 
     freerdp_settings_set_bool(settings, FreeRDP_RefreshRect, true);
@@ -691,6 +691,11 @@ void RdpConnection::run(std::stop_token stopToken)
         // too. Waiting only for socket activity stretched idle bandwidth
         // windows to 1.0-1.6 s in the 2026-09-16 journal.
         WaitForMultipleObjects(1 + handleCount, events.data(), FALSE, 100);
+
+        if (d->networkDetection->connectTimeProbeTimedOut()) {
+            qCWarning(KRDP) << "Connection-time bandwidth probe exceeded eight seconds; closing this peer";
+            break;
+        }
 
         // Read data from the socket and have FreeRDP process it.
         if (d->peer->CheckFileDescriptor(d->peer) != TRUE) {

@@ -48,13 +48,29 @@ BOOL rttMeasureResponse(rdpAutoDetect *rdpAutodetect, RDP_TRANSPORT_TYPE, uint16
     return FALSE;
 }
 
-BOOL bwMeasureResults(rdpAutoDetect *rdpAutodetect, RDP_TRANSPORT_TYPE, uint16_t, uint16_t, uint32_t timeDelta, uint32_t byteCount)
+BOOL bwMeasureResults(rdpAutoDetect *rdpAutodetect, RDP_TRANSPORT_TYPE, uint16_t sequence, uint16_t responseType, uint32_t timeDelta, uint32_t byteCount)
 {
     auto context = reinterpret_cast<PeerContext *>(rdpAutodetect->context);
-    if (context->networkDetection->onBandwidthMeasureResults(timeDelta, byteCount)) {
+    if (context->networkDetection->onBandwidthMeasureResults(timeDelta, byteCount, sequence, responseType)) {
         return TRUE;
     }
     return FALSE;
+}
+
+FREERDP_AUTODETECT_STATE beginNetworkProbe(rdpAutoDetect *autodetect)
+{
+    return reinterpret_cast<PeerContext *>(autodetect->context)->networkDetection->beginConnectTimeProbe();
+}
+
+FREERDP_AUTODETECT_STATE progressNetworkProbe(rdpAutoDetect *autodetect)
+{
+    return reinterpret_cast<PeerContext *>(autodetect->context)->networkDetection->progressConnectTimeProbe();
+}
+
+BOOL netCharSync(rdpAutoDetect *autodetect, RDP_TRANSPORT_TYPE, uint16_t sequence, uint32_t, uint32_t)
+{
+    // Auto-reconnect may answer an RTT request with NETCHAR_SYNC instead.
+    return reinterpret_cast<PeerContext *>(autodetect->context)->networkDetection->onRttMeasureResponse(sequence);
 }
 
 struct RTTMeasurement {
@@ -71,6 +87,15 @@ public:
     rdpAutoDetect *rdpAutodetect = nullptr;
 
     State state = State::None;
+    enum class ProbeStage { None, Rtt, Bandwidth, Complete };
+    ProbeStage probeStage = ProbeStage::None;
+    clk::steady_clock::time_point probeStarted;
+    uint32_t probeBytes = 0;
+    uint16_t probeSequence = 0;
+    bool probeRoundComplete = false;
+    uint32_t probeTimeDelta = 0;
+    uint32_t probeByteCount = 0;
+    bool hasProbedBandwidth = false;
 
     uint16_t sequenceNumber = 0;
 
@@ -134,6 +159,73 @@ void NetworkDetection::initialize()
     d->rdpAutodetect = d->session->rdpPeerContext()->autodetect;
     d->rdpAutodetect->RTTMeasureResponse = rttMeasureResponse;
     d->rdpAutodetect->BandwidthMeasureResults = bwMeasureResults;
+    d->rdpAutodetect->NetworkCharacteristicsSync = netCharSync;
+    if (!qEnvironmentVariableIsSet("KRDP_NO_BANDWIDTH_PROBE")) {
+        d->rdpAutodetect->OnConnectTimeAutoDetectBegin = beginNetworkProbe;
+        d->rdpAutodetect->OnConnectTimeAutoDetectProgress = progressNetworkProbe;
+    }
+}
+
+// Connection-time payload PDUs are supported by the protocol/FreeRDP only
+// before activation. Probe 64 KiB first; on fast links grow to 256 KiB and
+// at most 1 MiB for millisecond timer resolution (1.3125 MiB total maximum).
+// No synthetic graphics, padding traffic during normal use, or speed floor.
+FREERDP_AUTODETECT_STATE NetworkDetection::beginConnectTimeProbe()
+{
+    d->probeStage = Private::ProbeStage::Rtt;
+    d->probeStarted = clk::steady_clock::now();
+    auto sequence = d->nextSequenceNumber();
+    d->rttRequests.insert(sequence, clk::system_clock::now());
+    if (!d->rdpAutodetect->RTTMeasureRequest(d->rdpAutodetect, RDP_TRANSPORT_TCP, sequence)) {
+        d->probeStage = Private::ProbeStage::Complete;
+        return FREERDP_AUTODETECT_STATE_FAIL;
+    }
+    return FREERDP_AUTODETECT_STATE_REQUEST;
+}
+
+bool NetworkDetection::sendProbeRound(uint32_t bytes)
+{
+    constexpr uint16_t chunkBytes = 16384;
+    d->probeBytes = bytes;
+    d->probeSequence = d->nextSequenceNumber();
+    d->probeRoundComplete = false;
+    d->probeStage = Private::ProbeStage::Bandwidth;
+    auto *autodetect = d->rdpAutodetect;
+    if (!autodetect->BandwidthMeasureStart(autodetect, RDP_TRANSPORT_TCP, d->probeSequence)) return false;
+    for (uint32_t sent = chunkBytes; sent < bytes; sent += chunkBytes) {
+        if (!autodetect->BandwidthMeasurePayload(autodetect, RDP_TRANSPORT_TCP, d->probeSequence, chunkBytes)) return false;
+    }
+    return autodetect->BandwidthMeasureStop(autodetect, RDP_TRANSPORT_TCP, d->probeSequence, chunkBytes);
+}
+
+FREERDP_AUTODETECT_STATE NetworkDetection::progressConnectTimeProbe()
+{
+    if (d->probeStage == Private::ProbeStage::Rtt && !d->rttMeasurements.empty()) {
+        return sendProbeRound(64 * 1024) ? FREERDP_AUTODETECT_STATE_REQUEST : FREERDP_AUTODETECT_STATE_FAIL;
+    }
+    if (d->probeStage != Private::ProbeStage::Bandwidth || !d->probeRoundComplete) return FREERDP_AUTODETECT_STATE_REQUEST;
+    if (d->probeTimeDelta < 20 && d->probeBytes < 1024 * 1024) {
+        return sendProbeRound(d->probeBytes * 4) ? FREERDP_AUTODETECT_STATE_REQUEST : FREERDP_AUTODETECT_STATE_FAIL;
+    }
+    if (d->probeTimeDelta > 0 && d->probeByteCount >= d->probeBytes) {
+        d->reportedBandwidthKbps = static_cast<uint32_t>(static_cast<uint64_t>(d->probeByteCount) * 8 / d->probeTimeDelta);
+        d->hasProbedBandwidth = d->reportedBandwidthKbps > 0;
+        d->lastNetworkResult = {};
+        updateAverageRtt();
+        qCInfo(KRDP) << "Connection-time bandwidth probe:" << d->probeByteCount << "bytes in" << d->probeTimeDelta
+                    << "ms ->" << d->reportedBandwidthKbps << "kbit/s";
+    } else {
+        qCWarning(KRDP) << "Connection-time bandwidth probe did not produce a usable sample; retaining passive fallback";
+    }
+    d->probeStage = Private::ProbeStage::Complete;
+    return FREERDP_AUTODETECT_STATE_COMPLETE;
+}
+
+bool NetworkDetection::connectTimeProbeTimedOut() const
+{
+    const auto stage = d->probeStage;
+    return (stage == Private::ProbeStage::Rtt || stage == Private::ProbeStage::Bandwidth)
+        && clk::steady_clock::now() - d->probeStarted > clk::seconds(8);
 }
 
 void NetworkDetection::startBandwidthMeasure()
@@ -216,8 +308,16 @@ bool NetworkDetection::onRttMeasureResponse(uint16_t sequence)
     return true;
 }
 
-bool NetworkDetection::onBandwidthMeasureResults(uint32_t timeDelta, uint32_t byteCount)
+bool NetworkDetection::onBandwidthMeasureResults(uint32_t timeDelta, uint32_t byteCount, uint16_t sequence, uint16_t responseType)
 {
+    if (responseType == RDP_BW_RESULTS_RESPONSE_TYPE_CONNECTTIME) {
+        if (d->probeStage == Private::ProbeStage::Bandwidth && sequence == d->probeSequence) {
+            d->probeTimeDelta = timeDelta;
+            d->probeByteCount = byteCount;
+            d->probeRoundComplete = true;
+        }
+        return true;
+    }
     if (d->state != State::PendingResults) {
         return true;
     }
@@ -253,10 +353,12 @@ bool NetworkDetection::onBandwidthMeasureResults(uint32_t timeDelta, uint32_t by
     // FreeRDP 3.31 invokes our callback with byteCount/timeDelta; it does not
     // populate netCharBandwidth. The wire value is kilobits/s, not bytes/s.
     const auto measuredKbps = static_cast<uint32_t>(static_cast<uint64_t>(byteCount) * 8 / timeDelta);
-    if (measuredKbps > static_cast<uint64_t>(d->reportedBandwidthKbps) * 5 / 4) {
+    if (!d->hasProbedBandwidth && measuredKbps > static_cast<uint64_t>(d->reportedBandwidthKbps) * 5 / 4) {
         qCInfo(KRDP) << "Observed network throughput:" << measuredKbps << "kbit/s";
     }
-    d->reportedBandwidthKbps = std::max(d->reportedBandwidthKbps, measuredKbps);
+    if (!d->hasProbedBandwidth) {
+        d->reportedBandwidthKbps = std::max(d->reportedBandwidthKbps, measuredKbps);
+    }
 
     updateAverageRtt();
 
@@ -266,12 +368,14 @@ bool NetworkDetection::onBandwidthMeasureResults(uint32_t timeDelta, uint32_t by
 void NetworkDetection::updateAverageRtt()
 {
     auto now = clk::system_clock::now();
-    d->rttMeasurements.erase(std::remove_if(d->rttMeasurements.begin(),
-                                            d->rttMeasurements.end(),
-                                            [now](const auto &measurement) {
-                                                return (now - measurement.measurementTime) > rttAverageInterval;
-                                            }),
-                             d->rttMeasurements.end());
+    if (d->probeStage != Private::ProbeStage::Bandwidth) {
+        d->rttMeasurements.erase(std::remove_if(d->rttMeasurements.begin(),
+                                                d->rttMeasurements.end(),
+                                                [now](const auto &measurement) {
+                                                    return (now - measurement.measurementTime) > rttAverageInterval;
+                                                }),
+                                 d->rttMeasurements.end());
+    }
     if (d->rttMeasurements.empty()) {
         return;
     }
