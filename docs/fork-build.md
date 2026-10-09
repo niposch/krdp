@@ -1,6 +1,6 @@
 # Building and checking the maintained fork
 
-Maintained branch: `virtual-stock-kpipewire` at
+Maintained branch: `main` at
 [github.com/niposch/krdp](https://github.com/niposch/krdp). This is a GitHub fork
 of KDE's mirror, with the official KDE v6.7.5 base and earlier westers custom
 history merged without squashing or rewriting. KDE's source of truth is
@@ -20,7 +20,7 @@ CMake reports any missing dependencies. No development Plasma upgrade is needed.
 From a clean clone, choose a fresh build directory and private staging prefix:
 
 ```bash
-git clone --branch virtual-stock-kpipewire https://github.com/niposch/krdp.git
+git clone --branch main https://github.com/niposch/krdp.git
 cd krdp
 cmake -S . -B build-niposch -G Ninja \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \

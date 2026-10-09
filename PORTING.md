@@ -1,6 +1,7 @@
 # KDE upstream merge and local RDP integration — 2026-10-09
 
-The maintained branch is `virtual-stock-kpipewire` in
+The maintained branch is `main` (renamed from `virtual-stock-kpipewire`
+after publication) in
 [niposch/krdp](https://github.com/niposch/krdp), a GitHub fork of KDE/krdp. Official KDE KRDP `v6.7.5`
 (`270dcf01851229134f74fa7d90ac338ec788ec67`) is merged into our existing history.
 The temporary KDE-based `port/6.7.5-custom` branch was the tested integration

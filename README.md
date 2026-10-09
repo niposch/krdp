@@ -4,7 +4,7 @@
 
 This fork combines **official KDE KRDP v6.7.5** with the earlier
 [westers/krdp](https://github.com/westers/krdp) multi-monitor work and the fixes
-below. The maintained/default branch is **`virtual-stock-kpipewire`**.
+below. The maintained/default branch is **`main`**.
 Official KDE history and the original custom history are preserved by merge
 commit [`74c6991`](https://github.com/niposch/krdp/commit/74c6991e2a38b9836c2d7afd2761c519bb13a856).
 Upstream development continues at [KDE Invent](https://invent.kde.org/plasma/krdp);
