@@ -1,7 +1,7 @@
 # KDE upstream merge and local RDP integration — 2026-10-09
 
 The maintained branch is `virtual-stock-kpipewire` in
-`/home/niposch/Development/krdp-westers`. Official KDE KRDP `v6.7.5`
+[niposch/krdp](https://github.com/niposch/krdp), a GitHub fork of KDE/krdp. Official KDE KRDP `v6.7.5`
 (`270dcf01851229134f74fa7d90ac338ec788ec67`) is merged into our existing history.
 The temporary KDE-based `port/6.7.5-custom` branch was the tested integration
 vehicle; it does not replace the original maintained branch.
@@ -70,12 +70,11 @@ both monitor surfaces correctly through progressive and Intel-encoded AVC420;
 progressive also initializes both surfaces from partial first-frame damage.
 These tests never capture the desktop or use system login/clipboard data.
 
-Exact runtime activation, binary hashes, Windows validation limits, backup and
-rollback are recorded in
-`/home/niposch/Administration/docs/krdp-color-codecs-and-merge.md`.
-The prior 09:41 trial confirmed two Windows screens and pointer movement.
-Post-merge Windows color/capture, local takeover and natural resume still need
-checking. No beta Plasma/input dependency is adopted; KDE master additionally
+Portable build, dependency-patch and validation instructions are in
+[docs/fork-build.md](docs/fork-build.md). Windows RDP on the final corrected
+merged runtime confirmed both screens, pointer movement, Spotify green and
+bandwidth display; its actual startup probe measured 36,193 kbit/s.
+Local takeover and another natural resume still need checking. No beta Plasma/input dependency is adopted; KDE master additionally
 requires libei >=1.6 and needs a separate future migration.
 
 ## Network estimate correction and active probe
@@ -94,9 +93,10 @@ The probe is disabled by default: `KRDP_BANDWIDTH_PROBE=1` explicitly enables it
 The first Windows trial failed with 0x1304 and was rolled back. The corrected
 8-KiB payload stays within PER's 14-bit unfragmented length form; Windows
 now completes real probe exchanges (~54–87 Mbit/s in the synthetic LAN test).
-The synthetic login then closed because no test password was entered. NETCHAR_SYNC
+The synthetic login then closed; the user reported no test password entry,
+consistent with a fixture authentication failure. NETCHAR_SYNC
 now cancels probing and uses cached metrics as required by MS-RDPBCGR; this
-regression is tested. Normal-server login/display validation follows deployment.
+regression is tested. Normal-server login/display validation subsequently passed with Windows RDP.
 Clients without
 negotiated auto-detection skip it. Probe results are an estimate at connection
 start, not a guarantee of Wi-Fi/link capacity for the entire session. Reconnect

@@ -1,14 +1,68 @@
 # KRdp
 
-> **Local Fedora branch, October 9, 2026:** official KDE KRDP v6.7.5 is merged
-> into `virtual-stock-kpipewire`. Custom multi-monitor/layout/recovery/input
-> work is preserved. Progressive fallback and per-monitor encoder ownership
-> are integrated. With stock KPipeWire the actual H.264 wire codec is AVC420;
-> older AVC444 descriptions below require a true dual-stream encoder and do
-> not describe this deployment. The private KPipeWireRecord color patch and
-> current build/runtime/rollback details are in [PORTING.md](PORTING.md) and
-> `/home/niposch/Administration/docs/krdp-color-codecs-and-merge.md`.
+## niposch fork: Windows RDP and multiple monitors
 
+This fork combines **official KDE KRDP v6.7.5** with the earlier
+[westers/krdp](https://github.com/westers/krdp) multi-monitor work and the fixes
+below. The maintained/default branch is **`virtual-stock-kpipewire`**.
+Official KDE history and the original custom history are preserved by merge
+commit [`74c6991`](https://github.com/niposch/krdp/commit/74c6991e2a38b9836c2d7afd2761c519bb13a856).
+Upstream development continues at [KDE Invent](https://invent.kde.org/plasma/krdp);
+this GitHub repository is a fork of its [official KDE mirror](https://github.com/KDE/krdp).
+
+### What this branch adds and fixes
+
+- **Multiple monitors:** retain a capture pipeline, encoder and RDP surface per
+  monitor; client-shaped virtual outputs, replace/extend policies, physical
+  output restore and local takeover; monitor-aware pointer, cursor and wheel
+  behavior, layout reconciliation and stream recovery. Use `MonitorMode=virtual`
+  with `VirtualMonitorLayout=client` for Windows `/multimon`.
+- **Clipboard freeze:** text-only owned snapshots in both Plasma and portal
+  backends avoid blocking on every image MIME offer. Unicode text works in both
+  directions. **Image clipboard transfer is still unimplemented**; it needs
+  deferred, bounded PNG/DIB format handling rather than eager payload reads.
+- **Progressive codec:** adapt upstream tiled progressive encoding to multiple
+  monitors, with independent surface state, full first-frame initialization,
+  monitor-specific damage and bounded frame queues. Auto keeps hardware H.264
+  AVC420 when supported and falls back to progressive. `Codec=progressive` or
+  `KRDP_NO_H264=1` selects progressive explicitly.
+- **Accurate codec reporting:** stock KPipeWire supplies AVC420, so advertising
+  and logs now match the actual wire codec. True dual-stream AVC444 is not
+  implemented by this dependency; older AVC444 descriptions below are historical.
+- **Correct desktop colors:** the included
+  [KPipeWire v6.7.5 patch](patches/kpipewire-rdp-full-range-bt709.patch) applies
+  full-range BT.709 conversion and matching metadata to hardware/software
+  encoders. It fixes washed-out green on the tested Intel VAAPI path. This is a
+  separate dependency patch and must be built/loaded to obtain the color fix.
+- **Bandwidth estimate:** calculate valid RDP byte/time results correctly, keep
+  capacity estimates separate from idle video demand, and offer a real bounded
+  connection-time probe. Enable with **`KRDP_BANDWIDTH_PROBE=1`**. Random payloads
+  total at most 1.3125 MiB per connection; 8-KiB packets avoid the Windows
+  `0x1304` failure of the first trial. Cached reconnect metrics, timeouts and
+  clients without auto-detection are handled. Probing is opt-in, not continuous.
+- **Upstream fixes:** merge stable version/dependency/translation updates and
+  compatible peer cleanup, portal, cursor and FreeRDP security corrections while
+  preserving custom input and recovery behavior.
+
+### Tested status (2026-10-09)
+
+Fedora 44 KDE, KRDP/KPipeWire 6.7.5, FreeRDP 3.31.1, PipeWire 1.6.9 and
+WirePlumber 0.5.18. Windows RDP confirmed two screens, pointer movement, corrected
+Spotify green and bandwidth display. The real startup probe measured **36.2 Mbit/s**
+on the tested connection; this is an observation, not a guaranteed link speed.
+All 15 functional checks passed; the appstream check skips before installation.
+Synthetic two-surface progressive/AVC420 decode, clipboard negative controls and
+25-connection peer cleanup checks passed. Local takeover and another natural
+suspend/resume remain to be verified after this merge.
+
+**[Build, dependency patch and validation instructions](docs/fork-build.md)** ·
+**[Integration/history notes](PORTING.md)** ·
+**[Unmodified KDE v6.7.5 README](docs/upstream-readme-v6.7.5.md)**
+
+The original fork documentation follows; refer to the summary above for current
+codec support, clipboard limitations and verified behavior.
+
+---
 
 Library and examples for creating an RDP server.
 
