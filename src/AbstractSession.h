@@ -6,7 +6,7 @@
 
 #include "krdp_export.h"
 
-#include <PipeWireEncodedStream>
+#include "CaptureStream.h"
 #include <PipeWireSourceStream>
 #include <QPointF>
 #include <QRect>
@@ -36,6 +36,8 @@ public:
      * Properties have been initialised and we can start the session
      */
     virtual void start() = 0;
+    void bindVideoStream(QObject *owner, bool progressive, bool ready);
+    void setProgressive(bool progressive);
 
     bool streamingEnabled() const;
     /**
@@ -229,7 +231,7 @@ protected:
     void setStarted(bool started);
     void setSize(QSize size);
     void setLogicalSize(QSize size);
-    PipeWireEncodedStream *stream();
+    CaptureStream *stream();
 
 private:
     class Private;

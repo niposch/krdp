@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: 2023 Arjen Hiemstra <ahiemstra@heimr.nl>
 # SPDX-License-Identifier: BSD-2-Clause
 
-set(PROJECT_VERSION "6.6.80")
+set(PROJECT_VERSION "6.7.5")
 
 cmake_minimum_required(VERSION 3.16)
 
-set(QT_MIN_VERSION "6.9.2")
-set(KF6_MIN_VERSION "6.22.0")
+set(QT_MIN_VERSION "6.10.0")
+set(KF6_MIN_VERSION "6.26.0")
 set(KDE_COMPILERSETTINGS_LEVEL "5.85")
 
 project(KRdp VERSION "${PROJECT_VERSION}")
@@ -31,6 +31,7 @@ include(ECMQtDeclareLoggingCategory)
 include(ECMEnableSanitizers)
 include(ECMDeprecationSettings)
 include(ECMQmlModule)
+include(ECMFindQmlModule)
 
 option(BUILD_EXAMPLES "Build example applications" ON)
 option(BUILD_PLASMA_SESSION "Build support for Plasma Screencasting extensions" ON)
@@ -38,7 +39,7 @@ option(BUILD_PLASMA_SESSION "Build support for Plasma Screencasting extensions" 
 find_package(Qt6 ${QT_MIN_VERSION} CONFIG REQUIRED Core Quick Gui Network DBus WaylandClient Qml)
 
 if (Qt6Gui_VERSION VERSION_GREATER_EQUAL "6.10.0")
-    find_package(Qt6GuiPrivate ${REQUIRED_QT_VERSION} REQUIRED NO_MODULE)
+    find_package(Qt6GuiPrivate ${QT_MIN_VERSION} REQUIRED NO_MODULE)
 endif()
 
 find_package(KF6 ${KF6_MIN_VERSION} REQUIRED COMPONENTS Config DBusAddons KCMUtils I18n CoreAddons StatusNotifierItem Crash GuiAddons GlobalAccel)
@@ -69,14 +70,16 @@ set_package_properties(PAM PROPERTIES DESCRIPTION "PAM Libraries"
                        PURPOSE "Required for authentication"
                       )
 
+ecm_find_qmlmodule(org.kde.kirigamiaddons.formcard REQUIRED)
+
 set(EXCLUDE_DEPRECATED_BEFORE_AND_AT 0 CACHE STRING "Control the range of deprecated API excluded from the build [default=0].")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED TRUE)
 
 
-ecm_set_disabled_deprecation_versions(QT 6.7.0
-    KF 6.12.0
+ecm_set_disabled_deprecation_versions(QT 6.11.0
+    KF 6.23.0
 )
 
 add_subdirectory(src)

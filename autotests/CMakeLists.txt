@@ -1,3 +1,11 @@
+# SPDX-FileCopyrightText: 2026 Nicolas Fella <nicolas.fella@gmx.de>
+# SPDX-License-Identifier: BSD-2-Clause
+
+add_test(NAME kcm_smoketest COMMAND kcmshell6 --smoke-test kcm_krdpserver)
+set_tests_properties(kcm_smoketest PROPERTIES
+    ENVIRONMENT_MODIFICATION QT_PLUGIN_PATH=path_list_prepend:${CMAKE_BINARY_DIR}/bin
+)
+
 add_executable(AdaptiveQualityTest AdaptiveQualityTest.cpp)
 target_include_directories(AdaptiveQualityTest PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(AdaptiveQualityTest PRIVATE Qt6::Test Qt6::Core)
@@ -15,7 +23,7 @@ add_test(NAME MultiLayoutTest COMMAND MultiLayoutTest)
 
 add_executable(FrameQueuePolicyTest FrameQueuePolicyTest.cpp)
 target_include_directories(FrameQueuePolicyTest PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(FrameQueuePolicyTest PRIVATE Qt6::Test Qt6::Core)
+target_link_libraries(FrameQueuePolicyTest PRIVATE Qt6::Test Qt6::Core Qt6::Gui)
 add_test(NAME FrameQueuePolicyTest COMMAND FrameQueuePolicyTest)
 
 add_executable(ClientDisplayInfoTest ClientDisplayInfoTest.cpp)
@@ -70,3 +78,12 @@ target_include_directories(VideoCodecSupportTest PRIVATE ${CMAKE_SOURCE_DIR}/src
 target_include_directories(VideoCodecSupportTest SYSTEM PRIVATE ${FreeRDP_INCLUDE_DIR} ${WinPR_INCLUDE_DIR})
 target_link_libraries(VideoCodecSupportTest PRIVATE Qt6::Test Qt6::Core)
 add_test(NAME VideoCodecSupportTest COMMAND VideoCodecSupportTest)
+
+add_executable(ProgressiveCodecTest ProgressiveCodecTest.cpp)
+target_include_directories(ProgressiveCodecTest SYSTEM PRIVATE ${FreeRDP_INCLUDE_DIR} ${WinPR_INCLUDE_DIR})
+target_link_libraries(ProgressiveCodecTest PRIVATE Qt6::Test Qt6::Gui freerdp winpr)
+add_test(NAME ProgressiveCodecTest COMMAND ProgressiveCodecTest)
+
+add_executable(krdp-synthetic-video-server SyntheticVideoServer.cpp)
+target_include_directories(krdp-synthetic-video-server PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/src)
+target_link_libraries(krdp-synthetic-video-server PRIVATE Qt6::Gui KRdp)

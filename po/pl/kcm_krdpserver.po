@@ -1,13 +1,13 @@
 # Copyright (C) 2024 This file is copyright:
 # This file is distributed under the same license as the krdp package.
-# SPDX-FileCopyrightText: 2024, 2025 Łukasz Wojniłowicz <lukasz.wojnilowicz@gmail.com>
+# SPDX-FileCopyrightText: 2024-2026 Łukasz Wojniłowicz <lukasz.wojnilowicz@gmail.com>
 #
 msgid ""
 msgstr ""
 "Project-Id-Version: krdp\n"
 "Report-Msgid-Bugs-To: https://bugs.kde.org\n"
-"POT-Creation-Date: 2026-01-17 00:45+0000\n"
-"PO-Revision-Date: 2025-12-06 15:49+0100\n"
+"POT-Creation-Date: 2026-04-23 00:45+0000\n"
+"PO-Revision-Date: 2026-05-09 16:19+0200\n"
 "Last-Translator: Łukasz Wojniłowicz <lukasz.wojnilowicz@gmail.com>\n"
 "Language-Team: pl\n"
 "Language: pl\n"
@@ -16,7 +16,7 @@ msgstr ""
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=3; plural=(n==1 ? 0 : n%10>=2 && n%10<=4 && (n%100<10 "
 "|| n%100>=20) ? 1 : 2);\n"
-"X-Generator: Lokalize 25.08.2\n"
+"X-Generator: Lokalize 26.04.0\n"
 
 #. i18n: ectx: label, entry (ListenPort), group (General)
 #: krdpserversettings.kcfg:14
@@ -180,8 +180,8 @@ msgid ""
 "Set up remote login to connect using apps supporting the “RDP” remote "
 "desktop protocol."
 msgstr ""
-"Ustaw zdalne dane dostępowe, aby móc łączyć się przy użyciu aplikacji "
-"obsługujących protokół pulpitu zdalnego \"RDP\"."
+"Ustaw dane dostępowe do dostępu zdalnego, aby móc łączyć się przy użyciu "
+"aplikacji obsługujących protokół pulpitu zdalnego \"RDP\"."
 
 #: ui/main.qml:153
 #, kde-format
@@ -212,7 +212,7 @@ msgstr "Uruchamiaj wraz z systemem"
 #, kde-format
 msgctxt "@label:textbox"
 msgid "Listening Port:"
-msgstr "Port nasłuchujący:"
+msgstr "Nasłuchuj na porcie:"
 
 #: ui/main.qml:253
 #, kde-format
@@ -220,49 +220,49 @@ msgctxt "@label:textbox"
 msgid "Video quality:"
 msgstr "Jakość obrazu:"
 
-#: ui/main.qml:272
+#: ui/main.qml:273
 #, kde-format
 msgctxt "@label:slider"
 msgid "Responsiveness"
-msgstr "Responsywność"
+msgstr "Szybkość"
 
-#: ui/main.qml:278
+#: ui/main.qml:279
 #, kde-format
 msgctxt "@label:slider"
 msgid "Quality"
 msgstr "Jakość"
 
-#: ui/main.qml:285
+#: ui/main.qml:286
 #, kde-format
 msgctxt "title:group Group of RDP server settings"
 msgid "Security Certificates"
 msgstr "Certyfikaty zabezpieczeń"
 
-#: ui/main.qml:290
+#: ui/main.qml:291
 #, kde-format
 msgctxt "@label:check generate security certificates automatically"
 msgid "Generate automatically"
 msgstr "Utwórz sam"
 
-#: ui/main.qml:308
+#: ui/main.qml:309
 #, kde-format
 msgctxt "@label:textbox"
 msgid "Certificate path:"
 msgstr "Ścieżka certyfikatu:"
 
-#: ui/main.qml:323
+#: ui/main.qml:324
 #, kde-format
 msgctxt "@action:button"
 msgid "Choose Certificate File…"
 msgstr "Wskaż plik certyfikatu…"
 
-#: ui/main.qml:335
+#: ui/main.qml:336
 #, kde-format
 msgctxt "@label:textbox"
 msgid "Certificate key path:"
 msgstr "Ścieżka klucza certyfikatu:"
 
-#: ui/main.qml:351
+#: ui/main.qml:352
 #, kde-format
 msgctxt "@action:button"
 msgid "Choose Certificate Key File…"
@@ -322,7 +322,7 @@ msgstr "Nazwy użytkowników"
 #, kde-format
 msgctxt "@action:button"
 msgid "Add New…"
-msgstr "Dodaj nowy…"
+msgstr "Dodaj nowego…"
 
 #: ui/UserListView.qml:26
 #, kde-format

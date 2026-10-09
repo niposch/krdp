@@ -8,6 +8,7 @@
 #include <memory>
 
 #include <QByteArray>
+#include <QImage>
 #include <QRegion>
 #include <QSize>
 #include <QVector>
@@ -33,6 +34,7 @@ struct VideoFrame {
      * h264 compressed data in YUV420 color space.
      */
     QByteArray data;
+    QImage image;
     /**
      * Area of the frame that was actually damaged.
      * TODO: Actually use this information.
@@ -41,7 +43,7 @@ struct VideoFrame {
     /**
      * Whether the packet contains all the information
      */
-    bool isKeyFrame;
+    bool isKeyFrame = false;
     /**
      * Logical monitor layout mapped into this frame's coordinate space.
      */

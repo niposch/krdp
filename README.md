@@ -1,5 +1,15 @@
 # KRdp
 
+> **Local Fedora branch, October 9, 2026:** official KDE KRDP v6.7.5 is merged
+> into `virtual-stock-kpipewire`. Custom multi-monitor/layout/recovery/input
+> work is preserved. Progressive fallback and per-monitor encoder ownership
+> are integrated. With stock KPipeWire the actual H.264 wire codec is AVC420;
+> older AVC444 descriptions below require a true dual-stream encoder and do
+> not describe this deployment. The private KPipeWireRecord color patch and
+> current build/runtime/rollback details are in [PORTING.md](PORTING.md) and
+> `/home/niposch/Administration/docs/krdp-color-codecs-and-merge.md`.
+
+
 Library and examples for creating an RDP server.
 
 

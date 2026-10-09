@@ -1,0 +1,82 @@
+diff --git a/src/h264vaapiencoder.cpp b/src/h264vaapiencoder.cpp
+index 4998b03..984d50a 100644
+--- a/src/h264vaapiencoder.cpp
++++ b/src/h264vaapiencoder.cpp
+@@ -98,7 +98,9 @@ bool H264VAAPIEncoder::initialize(const QSize &size)
+     outputs->next = nullptr;
+ 
+     const auto colorRange = m_colorRange == PipeWireBaseEncodedStream::ColorRange::Full ? "full"s : "limited"s;
+-    const auto filterGraph = std::format("hwmap=mode=direct:derive_device=vaapi,scale_vaapi=format=nv12:mode=fast:out_range={}", colorRange);
++    const auto colorMetadata = m_colorRange == PipeWireBaseEncodedStream::ColorRange::Full
++        ? ":out_color_matrix=bt709:out_color_primaries=bt709:out_color_transfer=bt709"s : ""s;
++    const auto filterGraph = std::format("hwmap=mode=direct:derive_device=vaapi,scale_vaapi=format=nv12:mode=fast:out_range={}{}", colorRange, colorMetadata);
+ 
+     ret = avfilter_graph_parse(m_avFilterGraph, filterGraph.data(), outputs, inputs, NULL);
+     if (ret < 0) {
+@@ -131,6 +133,12 @@ bool H264VAAPIEncoder::initialize(const QSize &size)
+     Q_ASSERT(!size.isEmpty());
+     m_avCodecContext->width = size.width();
+     m_avCodecContext->height = size.height();
++    if (m_colorRange == PipeWireBaseEncodedStream::ColorRange::Full) {
++        m_avCodecContext->color_range = AVCOL_RANGE_JPEG;
++        m_avCodecContext->colorspace = AVCOL_SPC_BT709;
++        m_avCodecContext->color_primaries = AVCOL_PRI_BT709;
++        m_avCodecContext->color_trc = AVCOL_TRC_BT709;
++    }
+     m_avCodecContext->max_b_frames = 0;
+     m_avCodecContext->gop_size = 100;
+     m_avCodecContext->pix_fmt = AV_PIX_FMT_VAAPI;
+diff --git a/src/libopenh264encoder.cpp b/src/libopenh264encoder.cpp
+index 5eb274c..59a941f 100644
+--- a/src/libopenh264encoder.cpp
++++ b/src/libopenh264encoder.cpp
+@@ -39,6 +39,9 @@ LibOpenH264Encoder::LibOpenH264Encoder(H264Profile profile, PipeWireProduce *pro
+ 
+ bool LibOpenH264Encoder::initialize(const QSize &size)
+ {
++    if (m_colorRange == PipeWireBaseEncodedStream::ColorRange::Full) {
++        m_filterGraphToParse = u"scale=in_range=full:out_range=full:out_color_matrix=bt709,format=yuv420p,pad=ceil(iw/2)*2:ceil(ih/2)*2,setparams=range=full:colorspace=bt709:color_primaries=bt709:color_trc=bt709"_s;
++    }
+     createFilterGraph(size);
+ 
+     auto codec = avcodec_find_encoder_by_name("libopenh264");
+@@ -53,6 +56,12 @@ bool LibOpenH264Encoder::initialize(const QSize &size)
+         return false;
+     }
+ 
++    if (m_colorRange == PipeWireBaseEncodedStream::ColorRange::Full) {
++        m_avCodecContext->color_range = AVCOL_RANGE_JPEG;
++        m_avCodecContext->colorspace = AVCOL_SPC_BT709;
++        m_avCodecContext->color_primaries = AVCOL_PRI_BT709;
++        m_avCodecContext->color_trc = AVCOL_TRC_BT709;
++    }
+     Q_ASSERT(!size.isEmpty());
+     m_avCodecContext->width = size.width();
+     m_avCodecContext->height = size.height();
+diff --git a/src/libx264encoder.cpp b/src/libx264encoder.cpp
+index 1b8246c..a9146b4 100644
+--- a/src/libx264encoder.cpp
++++ b/src/libx264encoder.cpp
+@@ -42,6 +42,9 @@ LibX264Encoder::LibX264Encoder(H264Profile profile, PipeWireProduce *produce)
+ 
+ bool LibX264Encoder::initialize(const QSize &size)
+ {
++    if (m_colorRange == PipeWireBaseEncodedStream::ColorRange::Full) {
++        m_filterGraphToParse = u"scale=in_range=full:out_range=full:out_color_matrix=bt709,format=yuv420p,pad=ceil(iw/2)*2:ceil(ih/2)*2,setparams=range=full:colorspace=bt709:color_primaries=bt709:color_trc=bt709"_s;
++    }
+     createFilterGraph(size);
+ 
+     auto codec = avcodec_find_encoder_by_name("libx264");
+@@ -56,6 +59,12 @@ bool LibX264Encoder::initialize(const QSize &size)
+         return false;
+     }
+ 
++    if (m_colorRange == PipeWireBaseEncodedStream::ColorRange::Full) {
++        m_avCodecContext->color_range = AVCOL_RANGE_JPEG;
++        m_avCodecContext->colorspace = AVCOL_SPC_BT709;
++        m_avCodecContext->color_primaries = AVCOL_PRI_BT709;
++        m_avCodecContext->color_trc = AVCOL_TRC_BT709;
++    }
+     Q_ASSERT(!size.isEmpty());
+     // Important: libx264 rejects streams with sizes that are not even. So to
+     // ensure we don't get errors, we need to ensure the size we set here is

@@ -4,19 +4,19 @@
 add_library(KRdp)
 
 if (BUILD_PLASMA_SESSION)
-    if (Qt6_VERSION VERSION_GREATER_EQUAL "6.8.0")
-        set(private_code_option  "PRIVATE_CODE")
-    endif()
-    qt6_generate_wayland_protocol_client_sources(KRdp FILES
-        ${PLASMA_WAYLAND_PROTOCOLS_DIR}/zkde-screencast-unstable-v1.xml
-        ${PLASMA_WAYLAND_PROTOCOLS_DIR}/fake-input.xml
-        ${Wayland_DATADIR}/wayland.xml
-        ${private_code_option}
+    qt6_generate_wayland_protocol_client_sources(KRdp
+        PRIVATE_CODE
+        FILES
+            ${PLASMA_WAYLAND_PROTOCOLS_DIR}/zkde-screencast-unstable-v1.xml
+            ${PLASMA_WAYLAND_PROTOCOLS_DIR}/fake-input.xml
+            ${Wayland_DATADIR}/wayland.xml
     )
     target_sources(KRdp PRIVATE screencasting.cpp PlasmaScreencastV1Session.cpp)
 endif()
 
 target_sources(KRdp PRIVATE
+    CaptureStream.cpp
+    CaptureStream.h
     AbstractSession.cpp
     Clipboard.cpp
     Clipboard.h
@@ -46,7 +46,6 @@ ecm_qt_declare_logging_category(KRdp
     CATEGORY_NAME org.kde.krdp
     DESCRIPTION "KRdp"
     EXPORT KRdp
-    DEFAULT_SEVERITY Debug
 )
 
 ecm_generate_export_header(KRdp
@@ -80,6 +79,7 @@ target_link_libraries(KRdp PUBLIC
     KF6::ConfigCore
     K::KPipeWire
     K::KPipeWireRecord
+    K::KPipeWireDmaBuf
     XKB::XKB
 )
 

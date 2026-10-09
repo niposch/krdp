@@ -1,19 +1,20 @@
 # Translation of kcm_krdpserver to Norwegian Nynorsk
 #
+# Karl Ove Hufthammer <karl@huftis.org>, 2024, 2026.
 msgid ""
 msgstr ""
 "Project-Id-Version: krdp\n"
 "Report-Msgid-Bugs-To: https://bugs.kde.org\n"
-"POT-Creation-Date: 2026-01-17 00:45+0000\n"
-"PO-Revision-Date: 2024-08-08 22:05+0200\n"
+"POT-Creation-Date: 2026-04-23 00:45+0000\n"
+"PO-Revision-Date: 2026-04-21 19:22+0200\n"
 "Last-Translator: Karl Ove Hufthammer <karl@huftis.org>\n"
-"Language-Team: Norwegian Nynorsk <l10n-no@lister.huftis.org>\n"
+"Language-Team: Norwegian Nynorsk <l10n-no@nuug.no>\n"
 "Language: nn\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=2; plural=n != 1;\n"
-"X-Generator: Lokalize 24.11.70\n"
+"X-Generator: Lokalize 26.11.70\n"
 "X-Environment: kde\n"
 "X-Accelerator-Marker: &\n"
 "X-Text-Markup: kde4\n"
@@ -58,7 +59,7 @@ msgstr "Brukarar med løyve til å logga inn (passorda vert lagra i KWallet)"
 #: krdpserversettings.kcfg:35
 #, kde-format
 msgid "Whether the current user can log in via PAM"
-msgstr ""
+msgstr "Om gjeldande brukar kan logga inn via PAM"
 
 #. i18n: ectx: label, entry (Autostart), group (General)
 #: krdpserversettings.kcfg:39
@@ -165,13 +166,13 @@ msgstr "Bruk RDP-tenar"
 #, kde-format
 msgctxt "@info:status"
 msgid "Systemd not found. krdpserver will require manual activation."
-msgstr ""
+msgstr "Fann ikkje Systemd. krdpserver krev manuell aktivering."
 
 #: ui/main.qml:129
 #, kde-kuit-format
 msgctxt "@info:status"
 msgid "Error message from the RDP server:<nl/>%1"
-msgstr ""
+msgstr "Feilmelding frå RDP-tenaren:<nl/>%1"
 
 #: ui/main.qml:144 ui/main_phone.qml:101
 #, kde-format
@@ -218,49 +219,49 @@ msgctxt "@label:textbox"
 msgid "Video quality:"
 msgstr "Videokvalitet:"
 
-#: ui/main.qml:272
+#: ui/main.qml:273
 #, kde-format
 msgctxt "@label:slider"
 msgid "Responsiveness"
 msgstr "Reaksjonsevne"
 
-#: ui/main.qml:278
+#: ui/main.qml:279
 #, kde-format
 msgctxt "@label:slider"
 msgid "Quality"
 msgstr "Kvalitet"
 
-#: ui/main.qml:285
+#: ui/main.qml:286
 #, kde-format
 msgctxt "title:group Group of RDP server settings"
 msgid "Security Certificates"
 msgstr "Tryggleikssertifikat"
 
-#: ui/main.qml:290
+#: ui/main.qml:291
 #, kde-format
 msgctxt "@label:check generate security certificates automatically"
 msgid "Generate automatically"
 msgstr "Generer automatisk"
 
-#: ui/main.qml:308
+#: ui/main.qml:309
 #, kde-format
 msgctxt "@label:textbox"
 msgid "Certificate path:"
 msgstr "Sertifikatadresse:"
 
-#: ui/main.qml:323
+#: ui/main.qml:324
 #, kde-format
 msgctxt "@action:button"
 msgid "Choose Certificate File…"
 msgstr "Vel sertifikatfil …"
 
-#: ui/main.qml:335
+#: ui/main.qml:336
 #, kde-format
 msgctxt "@label:textbox"
 msgid "Certificate key path:"
 msgstr "Adresse til sertifikatnøkkel:"
 
-#: ui/main.qml:351
+#: ui/main.qml:352
 #, kde-format
 msgctxt "@action:button"
 msgid "Choose Certificate Key File…"
@@ -270,26 +271,26 @@ msgstr "Vel sertifikatnøkkelfil …"
 #, kde-format
 msgctxt "@title:group"
 msgid "Remote Desktop Access"
-msgstr ""
+msgstr "Tilgang til eksternt skrivebord"
 
 #: ui/main_phone.qml:105
-#, fuzzy, kde-format
+#, kde-format
 msgctxt "@option:check"
 msgid "Enable RDP Server"
 msgstr "Bruk RDP-tenar"
 
 #: ui/main_phone.qml:128
-#, fuzzy, kde-format
+#, kde-format
 msgid "Hostname:"
-msgstr "Brukarnamn:"
+msgstr "Vertsnamn:"
 
 #: ui/main_phone.qml:134
-#, fuzzy, kde-format
+#, kde-format
 msgid "Use any of the following addresses to connect to this device:"
 msgstr "Bruk ei av desse adressene til å kopla til eininga:"
 
 #: ui/main_phone.qml:172
-#, fuzzy, kde-format
+#, kde-format
 msgctxt "@title:group"
 msgid "Server Settings"
 msgstr "Tenarinnstillingar"
@@ -343,19 +344,19 @@ msgstr "Trykk <interface>Legg til ny …</interface> for å leggja til ein"
 #, kde-format
 msgctxt "@title:group"
 msgid "System Users"
-msgstr ""
+msgstr "Systembrukarar"
 
 #: ui/UserListView.qml:49
 #, kde-format
 msgctxt "@title:group"
 msgid "Other Users"
-msgstr ""
+msgstr "Andre brukarar"
 
 #: ui/UserListView.qml:67
 #, kde-format
 msgctxt "@info:usagetip used as a subtitle for a title+subtitle list item"
 msgid "Login with your system password"
-msgstr ""
+msgstr "Logg inn med systempassord"
 
 #: ui/UserListView.qml:99
 #, kde-format

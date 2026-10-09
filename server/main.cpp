@@ -84,7 +84,7 @@ KRdp::CodecPreference codecPreferenceFrom(const QString &value)
     if (const auto parsed = KRdp::VideoCodecSupport::parseCodecPreference(value)) {
         return *parsed;
     }
-    qWarning() << "Unknown Codec value" << value << "(auto|avc420|avc444); using auto";
+    qWarning() << "Unknown Codec value" << value << "(auto|avc420|avc444|progressive); using auto";
     return KRdp::CodecPreference::Auto;
 }
 
@@ -150,6 +150,7 @@ int main(int argc, char **argv)
     application.setDesktopFileName(u"org.kde.krdpserver"_s);
 
     KAboutData about(u"krdp-server"_s, u"KRDP Server"_s, QStringLiteral(KRdp_VERSION_STRING));
+    about.setDesktopFileName(u"org.kde.krdpserver"_s);
     KAboutData::setApplicationData(about);
 
     KCrash::initialize();

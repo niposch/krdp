@@ -13,6 +13,7 @@ private Q_SLOTS:
         QVERIFY(parseCodecPreference(u"auto") == CodecPreference::Auto);
         QVERIFY(parseCodecPreference(u" AVC420 ") == CodecPreference::Avc420);
         QVERIFY(parseCodecPreference(u"Avc444") == CodecPreference::Avc444);
+        QVERIFY(parseCodecPreference(u"progressive") == CodecPreference::Progressive);
         QVERIFY(!parseCodecPreference(u"avc444v2").has_value()); // the version is negotiated, not configured
         QVERIFY(!parseCodecPreference(u"").has_value());
         QCOMPARE(QString::fromLatin1(preferenceName(CodecPreference::Avc444)), QStringLiteral("avc444"));
@@ -45,8 +46,8 @@ private Q_SLOTS:
     }
     void expectedBeforeCaps()
     {
-        QVERIFY(expectedCodec(CodecPreference::Auto) == VideoCodec::Avc444v2);
-        QVERIFY(expectedCodec(CodecPreference::Avc444) == VideoCodec::Avc444v2);
+        QVERIFY(expectedCodec(CodecPreference::Auto) == VideoCodec::Avc420);
+        QVERIFY(expectedCodec(CodecPreference::Avc444) == VideoCodec::Avc420);
         QVERIFY(expectedCodec(CodecPreference::Avc420) == VideoCodec::Avc420);
     }
 };

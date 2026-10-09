@@ -5,6 +5,7 @@
 #include <QTest>
 
 #include "FrameQueuePolicy.h"
+#include "VideoFrame.h"
 
 using KRdp::FrameQueuePolicy::dropSupersededFrames;
 using KRdp::FrameQueuePolicy::supersededByKeyframe;
@@ -37,6 +38,27 @@ private Q_SLOTS:
     // Every mode but MonitorMode=multi stamps every frame with index 0, so a
     // keyframe still empties the whole queue - the behaviour this rule has
     // always had, and the reason the single-surface wire output is unchanged.
+    void rasterDamageCoalescesWithoutTouchingOtherMonitor()
+    {
+        QQueue<KRdp::VideoFrame> queue;
+        KRdp::VideoFrame first;
+        first.monitorIndex = 0; first.damage = QRect(0,0,10,10);
+        queue.append(first);
+        KRdp::VideoFrame second;
+        second.monitorIndex = 1; second.damage = QRect(20,20,10,10);
+        queue.append(second);
+        KRdp::VideoFrame newest;
+        newest.monitorIndex = 0; newest.damage = QRect(40,40,10,10);
+        newest.image = QImage(64,64,QImage::Format_RGB32);
+        newest.image.fill(Qt::green);
+        KRdp::FrameQueuePolicy::coalesceRasterFrame(queue, newest);
+        QCOMPARE(queue.size(), 2);
+        QCOMPARE(queue.first().monitorIndex, 1);
+        QCOMPARE(queue.first().damage, second.damage);
+        QCOMPARE(queue.last().monitorIndex, 0);
+        QCOMPARE(queue.last().damage, first.damage + newest.damage);
+        QCOMPARE(queue.last().image.pixelColor(0,0), QColor(Qt::green));
+    }
     void singleSurfaceQueueIsClearedWholesale()
     {
         QQueue<QueuedFrame> queue;

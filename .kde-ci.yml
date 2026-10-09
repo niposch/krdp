@@ -11,7 +11,9 @@ Dependencies:
       'frameworks/kcmutils': '@latest-kf6'
       'frameworks/kcrash': '@latest-kf6'
       'plasma/kpipewire': '@latest-kf6'
+      'libraries/kirigami-addons': '@latest-kf6'
       'third-party/qtkeychain': '@latest'
 
 Options:
   require-passing-tests-on: ['@all']
+  enable-lsan: True

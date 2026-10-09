@@ -185,6 +185,10 @@ PortalSession::PortalSession()
 
 PortalSession::~PortalSession()
 {
+    // Upstream 5976316: setup may have failed before a portal session exists.
+    if (d->sessionPath.path().isEmpty()) {
+        return;
+    }
     // Make sure to clear any modifier keys that were pressed when the session closed, otherwise
     // we risk those keys getting stuck and the original session becoming unusable.
     for (auto keycode : {KEY_LEFTCTRL, KEY_RIGHTCTRL, KEY_LEFTSHIFT, KEY_RIGHTSHIFT, KEY_LEFTALT, KEY_RIGHTALT, KEY_LEFTMETA, KEY_RIGHTMETA}) {
@@ -334,6 +338,7 @@ void PortalSession::onDevicesSelected(uint code, const QVariantMap & /*result*/)
     } else {
         parameters = {{QStringLiteral("types"), 1u}, // MONITOR
                       {QStringLiteral("multiple"), activeStream() >= 0}};
+    parameters[QStringLiteral("cursor_mode")] = 4u; // Upstream: cursor metadata
     }
 
     new PortalRequest(d->screencastInterface->SelectSources(d->sessionPath, parameters), this, &PortalSession::onSourcesSelected);
@@ -404,9 +409,19 @@ void KRdp::PortalSession::onSessionStarted(uint code, const QVariantMap &result)
             // Ensure we encode in full color range when the KPipeWire API supports it.
             setFullColorRangeIfSupported(encodedStream);
             setPreferredH264Encoder(encodedStream);
-            connect(encodedStream, &PipeWireEncodedStream::newPacket, this, &PortalSession::onPacketReceived);
-            connect(encodedStream, &PipeWireEncodedStream::sizeChanged, this, &PortalSession::setSize);
-            connect(encodedStream, &PipeWireEncodedStream::cursorChanged, this, &PortalSession::cursorUpdate);
+            connect(encodedStream, &CaptureStream::newPacket, this, &PortalSession::onPacketReceived);
+            connect(encodedStream, &CaptureStream::sizeChanged, this, &PortalSession::setSize);
+            connect(encodedStream, &CaptureStream::cursorChanged, this, &PortalSession::cursorUpdate);
+        connect(encodedStream, &CaptureStream::rasterFrame, this, [this](const QImage &image, const QRegion &damage) {
+            VideoFrame frame;
+            frame.size = image.size();
+            frame.image = image;
+            frame.damage = damage;
+            frame.isKeyFrame = true;
+            frame.monitorIndex = monitorIndex();
+            frame.monitors = d->monitorLayout;
+            Q_EMIT frameReceived(frame);
+        });
             QDBusConnection::sessionBus().connect(u"org.freedesktop.portal.Desktop"_s,
                                                   d->sessionPath.path(),
                                                   u"org.freedesktop.portal.Session"_s,

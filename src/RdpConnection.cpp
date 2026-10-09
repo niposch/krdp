@@ -393,7 +393,8 @@ RdpConnection::RdpConnection(Server *server, qintptr socketHandle)
 
 RdpConnection::~RdpConnection()
 {
-    if (d->state == State::Streaming) {
+    // Upstream 231bec4: unblock the peer thread in every connection state.
+    if (d->peer) {
         d->peer->Close(d->peer);
     }
 
@@ -403,6 +404,8 @@ RdpConnection::~RdpConnection()
     }
 
     if (d->peer) {
+        // Upstream 125d8de: the peer does not own/free its context.
+        freerdp_peer_context_free(d->peer);
         freerdp_peer_free(d->peer);
     }
 }
@@ -607,6 +610,8 @@ void RdpConnection::initialize()
     freerdp_settings_set_bool(settings, FreeRDP_RdpSecurity, false);
     freerdp_settings_set_bool(settings, FreeRDP_TlsSecurity, true);
     freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, false);
+    // Upstream 4eb3dff: retain the configured TLS/PAM path with FreeRDP 3.32.
+    freerdp_settings_set_bool(settings, FreeRDP_ExtSecurity, false);
 
     freerdp_settings_set_uint32(settings, FreeRDP_OsMajorType, OSMAJORTYPE_UNIX);
     // PSEUDO_XSERVER is apparently required for things to work properly.
@@ -619,11 +624,11 @@ void RdpConnection::initialize()
 
     // The RDPGFX pipeline with H.264. AVC444/AVC444v2 are advertised unless the configuration
     // pins the codec to AVC420; the codec is chosen per client in VideoStream::onCapsAdvertise().
-    const bool avc444 = d->videoStream->codecPreference() != CodecPreference::Avc420;
+    const bool avc444 = false; // Stock KPipeWire has no dual-stream AVC444 encoder.
     freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline, true);
     freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, avc444);
     freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444v2, avc444);
-    freerdp_settings_set_bool(settings, FreeRDP_GfxH264, true);
+    freerdp_settings_set_bool(settings, FreeRDP_GfxH264, d->videoStream->codecPreference() != CodecPreference::Progressive);
 
 
     freerdp_settings_set_bool(settings, FreeRDP_GfxSmallCache, false);
