@@ -10,20 +10,26 @@
 #include "VideoStream.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdint>
 #include <condition_variable>
+#include <limits>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 #include <QDateTime>
 #include <QQueue>
-#include <QSet>
+#include <QRect>
+#include <QStringList>
+#include <QTimer>
 
-#include <DmaBufHandler>
-#include <PipeWireEncodedStream>
-#include <freerdp/codec/progressive.h>
 #include <freerdp/freerdp.h>
 #include <freerdp/peer.h>
-#include <freerdp/update.h>
-#include <qassert.h>
 
+#include "AdaptiveQuality.h"
+#include "FrameQueuePolicy.h"
 #include "NetworkDetection.h"
 #include "PeerContext_p.h"
 #include "RdpConnection.h"
@@ -35,10 +41,154 @@ namespace KRdp
 
 namespace clk = std::chrono;
 
-// Maximum number of frames to contain in the queue.
-constexpr clk::system_clock::duration FrameRateEstimateAveragePeriod = clk::seconds(1);
-constexpr qsizetype MaximumInFlightFrames = 2;
-constexpr uint32_t ProgressiveCodecContextId = 1;
+constexpr uint16_t MaxRdpCoordinate = std::numeric_limits<uint16_t>::max();
+constexpr int MaxMonitorLayoutCount = 16;
+constexpr auto KeyFrameRequestMinInterval = clk::seconds(2);
+constexpr auto QualityUpdateInterval = clk::milliseconds(1500);
+// Don't take adaptive-quality decisions until NetworkDetection has had a few
+// RTT probes (every 70 ms) to establish a minimum-RTT baseline.
+constexpr auto WarmupAfterStreamStart = clk::seconds(3);
+
+// Atomically lowers `value` to `candidate` if it's lower, otherwise leaves it
+// alone. Used to track how close the client got to caught up since the
+// adaptive-quality decision last looked - see minPendingAfterAckSinceDecision.
+void bumpAtomicMin(std::atomic<int> &value, int candidate)
+{
+    int current = value.load(std::memory_order_relaxed);
+    while (candidate < current && !value.compare_exchange_weak(current, candidate, std::memory_order_relaxed)) {
+    }
+}
+
+RECTANGLE_16 toRdpRect(const QRect &rect)
+{
+    auto left = std::clamp(rect.x(), 0, int(MaxRdpCoordinate));
+    auto top = std::clamp(rect.y(), 0, int(MaxRdpCoordinate));
+    auto right = std::clamp(rect.x() + rect.width(), 0, int(MaxRdpCoordinate));
+    auto bottom = std::clamp(rect.y() + rect.height(), 0, int(MaxRdpCoordinate));
+
+    if (right <= left) {
+        right = std::min(left + 1, int(MaxRdpCoordinate));
+    }
+    if (bottom <= top) {
+        bottom = std::min(top + 1, int(MaxRdpCoordinate));
+    }
+
+    RECTANGLE_16 region;
+    region.left = static_cast<UINT16>(left);
+    region.top = static_cast<UINT16>(top);
+    region.right = static_cast<UINT16>(right);
+    region.bottom = static_cast<UINT16>(bottom);
+    return region;
+}
+
+QVector<VideoMonitor> monitorLayoutForReset(const VideoFrame &frame)
+{
+    QVector<VideoMonitor> monitors;
+    if (frame.size.isEmpty()) {
+        return monitors;
+    }
+
+    const QRect frameBounds(QPoint(0, 0), frame.size);
+    monitors.reserve(std::min<qsizetype>(frame.monitors.size(), MaxMonitorLayoutCount));
+    for (const auto &candidate : frame.monitors) {
+        if (monitors.size() >= MaxMonitorLayoutCount) {
+            break;
+        }
+
+        auto clippedGeometry = candidate.geometry.intersected(frameBounds);
+        if (clippedGeometry.isEmpty()) {
+            continue;
+        }
+        monitors.push_back(VideoMonitor{
+            .geometry = clippedGeometry,
+            .primary = candidate.primary,
+        });
+    }
+
+    if (monitors.isEmpty()) {
+        monitors.push_back(VideoMonitor{
+            .geometry = frameBounds,
+            .primary = true,
+        });
+    }
+
+    bool foundPrimary = false;
+    for (auto &monitor : monitors) {
+        if (monitor.primary && !foundPrimary) {
+            foundPrimary = true;
+        } else {
+            monitor.primary = false;
+        }
+    }
+    if (!foundPrimary) {
+        monitors.first().primary = true;
+    }
+
+    return monitors;
+}
+
+QString monitorLayoutSummary(const QVector<VideoMonitor> &monitors)
+{
+    QStringList parts;
+    parts.reserve(monitors.size());
+    for (const auto &monitor : monitors) {
+        parts.push_back(QStringLiteral("%1,%2 %3x%4%5")
+                            .arg(monitor.geometry.x())
+                            .arg(monitor.geometry.y())
+                            .arg(monitor.geometry.width())
+                            .arg(monitor.geometry.height())
+                            .arg(monitor.primary ? QStringLiteral(" primary") : QString()));
+    }
+    return parts.join(QStringLiteral("; "));
+}
+
+// Everything a reset needs: what ResetGraphics advertises and which surfaces
+// carry it. Kept in one place so the single-surface and per-monitor paths
+// cannot drift apart.
+struct ResetPlan {
+    QSize desktopSize;
+    QVector<VideoMonitor> monitors;
+    QVector<SurfaceLayout::Entry> surfaces;
+};
+
+ResetPlan planReset(const VideoFrame &frame, const QVector<VideoMonitor> &configuredLayout)
+{
+    ResetPlan plan;
+
+    if (configuredLayout.isEmpty()) {
+        // No explicit layout: one surface covering the whole frame, with the
+        // frame's own monitor list advertised inside it. This is what every
+        // mode but MonitorMode=multi does, and it is unchanged.
+        plan.desktopSize = frame.size;
+        plan.monitors = monitorLayoutForReset(frame);
+        plan.surfaces = {SurfaceLayout::Entry{
+            .size = frame.size,
+            .origin = QPoint(0, 0),
+            .primary = true,
+        }};
+        return plan;
+    }
+
+    // One surface per monitor, each mapped at its own RDP-space origin. The
+    // entries are consumed exactly as the helper produced them: it is the only
+    // place the layout is translated, and it already anchored the union at
+    // (0, 0), so the bounds below are the desktop extent.
+    plan.surfaces = SurfaceLayout::fromMonitors(configuredLayout);
+    plan.monitors.reserve(plan.surfaces.size());
+    QRect bounds;
+    for (const auto &entry : plan.surfaces) {
+        const QRect geometry(entry.origin, entry.size);
+        plan.monitors.push_back(VideoMonitor{
+            .geometry = geometry,
+            .primary = entry.primary,
+        });
+        bounds = bounds.united(geometry);
+    }
+    plan.desktopSize = bounds.size();
+
+    return plan;
+}
+
 struct RdpCapsInformation {
     uint32_t version;
     RDPGFX_CAPSET capSet;
@@ -101,213 +251,136 @@ uint32_t gfxQoEFrameAcknowledge(RdpgfxServerContext *, const RDPGFX_QOE_FRAME_AC
 }
 
 struct Surface {
-    uint16_t id;
-    uint32_t codecContextId;
+    uint16_t id = 0;
     QSize size;
-};
-
-struct FrameRateEstimate {
-    clk::system_clock::time_point timeStamp;
-    int estimate = 0;
+    // Top-left in RDP desktop space, as passed to MapSurfaceToOutput.
+    QPoint origin;
 };
 
 class KRDP_NO_EXPORT VideoStream::Private
 {
 public:
     using RdpGfxContextPtr = std::unique_ptr<RdpgfxServerContext, decltype(&rdpgfx_server_context_free)>;
-    using ProgressiveContextPtr = std::unique_ptr<PROGRESSIVE_CONTEXT, decltype(&progressive_context_free)>;
 
     RdpConnection *session;
-    std::optional<EncodingMode> activeEncodingMode;
-    std::unique_ptr<PipeWireEncodedStream> encodedStream;
-    std::unique_ptr<PipeWireSourceStream> sourceStream;
-    DmaBufHandler dmaBufHandler;
 
     RdpGfxContextPtr gfxContext = RdpGfxContextPtr(nullptr, rdpgfx_server_context_free);
-    ProgressiveContextPtr progressive = ProgressiveContextPtr(nullptr, progressive_context_free);
 
     uint32_t frameId = 0;
     uint32_t channelId = 0;
-    quint32 nodeId = 0;
-    int pipeWireFd = -1;
 
     uint16_t nextSurfaceId = 1;
-    Surface surface;
-    QSize size;
+    // surfaces/monitorLayout/configuredLayout are touched by three threads -
+    // the frame submission thread (performReset, sendFrame), the FreeRDP peer
+    // thread (onCapsAdvertise) and the main thread (setMonitorLayout) - so
+    // they need a lock. The single POD Surface they replace did not: clearing
+    // a QVector frees storage another thread may still be reading.
+    std::mutex layoutMutex;
+    // One surface per monitor; index == VideoFrame::monitorIndex. Exactly one
+    // entry unless a layout was configured.
+    QVector<Surface> surfaces;
 
     bool pendingReset = true;
     bool enabled = false;
-    bool streamingEnabled = false;
-    bool capsConfirmed = false;
-    bool channelOpen = false;
+    // Written on the FreeRDP peer thread (onCapsAdvertise), read by the submission thread.
+    std::atomic<bool> capsConfirmed = false;
 
     std::jthread frameSubmissionThread;
     std::mutex frameQueueMutex;
+    std::condition_variable frameQueueCondition;
 
     QQueue<VideoFrame> frameQueue;
+    // pendingFrames is inserted on the submission thread (sendFrame) and erased on
+    // the FreeRDP peer thread (onFrameAcknowledge).
     QSet<uint32_t> pendingFrames;
-
     std::mutex pendingFramesMutex;
 
-    int maximumFrameRate = 120;
+    // Fixed at the client-configured rate; read by the submission thread for its
+    // idle sleep interval. The RTT-derived source-rate heuristic was removed
+    // (upstream 978f1cb): it starved high-latency links without measuring real
+    // send-side pressure.
     std::atomic_int requestedFrameRate = 60;
-    QQueue<FrameRateEstimate> frameRateEstimates;
-    clk::system_clock::time_point lastFrameRateEstimation;
+    // The monitor list as last advertised in ResetGraphics, in RDP desktop
+    // space; a difference against the freshly planned one triggers a reset.
+    QVector<VideoMonitor> monitorLayout;
+    // The layout set by setMonitorLayout(); empty means "derive it from the
+    // frames", i.e. the single-surface behaviour.
+    QVector<VideoMonitor> configuredLayout;
+    // Submission-thread only: rate-limits keyFrameRequested so a reset storm
+    // (e.g. repeated caps re-advertisement) does not restart the encoder more
+    // than once per KeyFrameRequestMinInterval. One timestamp per surface.
+    QVector<clk::steady_clock::time_point> lastKeyFrameRequest;
+    // Latches so a frame for a surface that does not exist, a frame whose size
+    // does not match its surface, a failed CreateSurface or a session reporting
+    // a broken layout is reported once and not once per frame. The first three
+    // are cleared by a successful reset, so a later, different misconfiguration
+    // is still reported.
+    bool loggedUnknownSurface = false;
+    bool loggedSizeMismatch = false;
+    bool loggedCreateSurfaceFailure = false;
+    bool warnedInvalidLayout = false;
 
-    std::atomic_int encodedFrames = 0;
-    std::atomic_int frameDelay = 0;
-    bool initialized = false;
-    quint8 quality = 100;
+    // setQualityCap()/setAdaptiveQuality() and updateAdaptiveQuality() (the
+    // adaptiveTimer slot) all run on the main thread - VideoStream is
+    // constructed in RdpConnection's constructor and never moved to another
+    // thread. These stay atomic as belt-and-braces in case that ever changes,
+    // not because it's true today.
+    std::atomic<quint8> quality = 100; // current adaptive value
+    std::atomic<quint8> qualityCap = 100; // configured Quality
+    std::atomic<bool> adaptiveQuality = true;
+    // setCodecPreference()/codecPreference() are main-thread only (set before
+    // caps are advertised); onCapsAdvertise() (peer thread) only reads it.
+    CodecPreference codecPreference = CodecPreference::Auto;
+    // -1 = not negotiated yet (no CapsAdvertise received). Written on the
+    // FreeRDP peer thread (onCapsAdvertise), read from any thread via
+    // negotiatedCodec()/codecForSessions().
+    std::atomic<int> negotiatedCodec = -1;
+    // The total pixel count over every surface, as a single atomic value, so
+    // updateAdaptiveQuality() (main thread) never sees a torn width/height
+    // while performReset() (submission thread) or onCapsAdvertise() (peer
+    // thread) rebuilds the surfaces. Summed because one quality steers every
+    // session feeding this connection.
+    std::atomic<qint64> surfacePixels = 0;
+    // Backlog evidence for the adaptive-quality decision: the smallest number
+    // of frames still unacknowledged right after any ack since the last
+    // decision (INT_MAX = no ack since). Lowered on the connection thread in
+    // onFrameAcknowledge() under pendingFramesMutex (and to 0 wherever
+    // pendingFrames is cleared - a reset counts as caught up); read-and-reset
+    // by updateAdaptiveQuality() on the main thread.
+    std::atomic<int> minPendingAfterAckSinceDecision = std::numeric_limits<int>::max();
+    // Main-thread timer that drives updateAdaptiveQuality() every
+    // QualityUpdateInterval while streaming; started/stopped via queued
+    // invokeMethod so initialize()/close() may run on any thread.
+    QTimer adaptiveTimer;
+    clk::steady_clock::time_point streamingSince;
+    clk::steady_clock::time_point lastStepDown; // default = epoch = "never"
 
-    void setSize(VideoStream *q, const QSize &newSize)
+    // Call with layoutMutex held. Null when no surface carries that index,
+    // which is every index but 0 while no layout is configured.
+    Surface *surfaceFor(int index)
     {
-        if (size == newSize) {
-            return;
+        if (index < 0 || index >= surfaces.size()) {
+            return nullptr;
         }
-
-        size = newSize;
-        Q_EMIT q->sizeChanged(newSize);
+        return &surfaces[index];
     }
 };
 
-static QString encodingModeName(VideoStream::EncodingMode mode)
-{
-    switch (mode) {
-    case VideoStream::EncodingMode::H264:
-        return QStringLiteral("h264");
-    case VideoStream::EncodingMode::Progressive:
-        return QStringLiteral("progressive");
-    }
-    Q_UNREACHABLE();
-}
-
-bool VideoStream::h264Disabled()
-{
-    static const bool h264Disabled = qEnvironmentVariableIntValue("KRDP_DISABLE_H264") != 0;
-    return h264Disabled;
-}
-
-static RECTANGLE_16 toRectangle16(const QRect &rect)
-{
-    RECTANGLE_16 result = {};
-    result.left = rect.left();
-    result.top = rect.top();
-    result.right = rect.right() + 1;
-    result.bottom = rect.bottom() + 1;
-    return result;
-}
-
-static std::optional<REGION16> toRegion16(const QRegion &region, const QRect &frameRect)
-{
-    REGION16 invalidRegion = {};
-    region16_init(&invalidRegion);
-
-    const QRegion clipped = region.isEmpty() ? QRegion(frameRect) : region.intersected(frameRect);
-    for (const QRect &rect : clipped) {
-        if (!rect.isValid()) {
-            continue;
-        }
-
-        const RECTANGLE_16 rectangle = toRectangle16(rect);
-        if (!region16_union_rect(&invalidRegion, &invalidRegion, &rectangle)) {
-            region16_uninit(&invalidRegion);
-            return std::nullopt;
-        }
-    }
-
-    if (region16_is_empty(&invalidRegion)) {
-        const RECTANGLE_16 fullFrame = toRectangle16(frameRect);
-        if (!region16_union_rect(&invalidRegion, &invalidRegion, &fullFrame)) {
-            region16_uninit(&invalidRegion);
-            return std::nullopt;
-        }
-    }
-
-    return invalidRegion;
-}
 
 VideoStream::VideoStream(RdpConnection *session)
     : QObject(nullptr)
     , d(std::make_unique<Private>())
 {
     d->session = session;
-}
 
-void VideoStream::setActiveEncodingMode(EncodingMode mode)
-{
-    if (d->activeEncodingMode == mode) {
-        return;
-    }
+    // Needed for the queued negotiatedCodecChanged connection (emitted from the
+    // FreeRDP peer thread) and, once S2+ send them, chromaTimingReported.
+    qRegisterMetaType<KRdp::VideoCodec>();
+    qRegisterMetaType<KRdp::ChromaTimingReport>();
 
-    if (d->encodedStream) {
-        d->encodedStream->stop();
-        d->encodedStream.reset();
-    }
-    if (d->sourceStream) {
-        d->sourceStream->setActive(false);
-        d->sourceStream.reset();
-    }
-
-    {
-        std::lock_guard lock(d->frameQueueMutex);
-        d->frameQueue.clear();
-    }
-
-    d->activeEncodingMode = mode;
-
-    if (mode == EncodingMode::H264) {
-        d->encodedStream = std::make_unique<PipeWireEncodedStream>();
-        d->encodedStream->setEncodingPreference(PipeWireBaseEncodedStream::EncodingPreference::Speed);
-        d->encodedStream->setColorRange(PipeWireBaseEncodedStream::ColorRange::Full);
-        d->encodedStream->setEncoder(PipeWireEncodedStream::H264Baseline);
-        d->encodedStream->setQuality(d->quality);
-        d->encodedStream->setMaxFramerate(d->requestedFrameRate, 1);
-        d->encodedStream->setMaxPendingFrames(d->requestedFrameRate);
-
-        connect(d->encodedStream.get(), &PipeWireEncodedStream::newPacket, this, &VideoStream::onPacketReceived);
-        connect(d->encodedStream.get(), &PipeWireEncodedStream::sizeChanged, this, [this](const QSize &size) {
-            d->setSize(this, size);
-        });
-        connect(d->encodedStream.get(), &PipeWireEncodedStream::cursorChanged, this, &VideoStream::cursorChanged);
-        if (d->nodeId != 0) {
-            d->encodedStream->setNodeId(d->nodeId);
-            if (d->pipeWireFd > 0) {
-                d->encodedStream->setFd(d->pipeWireFd);
-            }
-        }
-        if (d->streamingEnabled && d->nodeId != 0) {
-            d->encodedStream->start();
-        }
-    } else {
-        d->sourceStream = std::make_unique<PipeWireSourceStream>();
-        d->sourceStream->setAllowDmaBuf(true);
-        d->sourceStream->setDamageEnabled(true);
-        d->sourceStream->setMaxFramerate({static_cast<quint32>(d->requestedFrameRate.load()), 1});
-        connect(d->sourceStream.get(), &PipeWireSourceStream::frameReceived, this, &VideoStream::onFrameReceived, Qt::QueuedConnection);
-        connect(d->sourceStream.get(), &PipeWireSourceStream::streamParametersChanged, this, [this]() {
-            d->setSize(this, d->sourceStream->size());
-        });
-        connect(
-            d->sourceStream.get(),
-            &PipeWireSourceStream::frameReceived,
-            this,
-            [this](const PipeWireFrame &frame) {
-                if (frame.cursor) {
-                    Q_EMIT cursorChanged(*frame.cursor);
-                }
-            },
-            Qt::QueuedConnection);
-
-        if (d->nodeId != 0 && d->pipeWireFd) {
-            if (!d->sourceStream->createStream(d->nodeId, d->pipeWireFd)) {
-                qCWarning(KRDP) << "Could not create PipeWire source stream" << d->sourceStream->error();
-                d->session->close(RdpConnection::CloseReason::VideoInitFailed);
-                return;
-            }
-            d->size = d->sourceStream->size();
-        }
-        d->sourceStream->setActive(d->streamingEnabled && d->nodeId != 0);
-    }
+    d->adaptiveTimer.setInterval(QualityUpdateInterval);
+    d->adaptiveTimer.setTimerType(Qt::CoarseTimer);
+    connect(&d->adaptiveTimer, &QTimer::timeout, this, &VideoStream::updateAdaptiveQuality);
 }
 
 VideoStream::~VideoStream()
@@ -317,100 +390,109 @@ VideoStream::~VideoStream()
 
 bool VideoStream::initialize()
 {
-    if (d->initialized) {
+    if (d->gfxContext) {
         return true;
     }
 
-    d->gfxContext.reset(rdpgfx_server_context_new(contextForPeer(d->session->rdpPeer())->virtualChannelManager));
+    auto peerContext = reinterpret_cast<PeerContext *>(d->session->rdpPeerContext());
+
+    d->gfxContext = Private::RdpGfxContextPtr{rdpgfx_server_context_new(peerContext->virtualChannelManager), rdpgfx_server_context_free};
     if (!d->gfxContext) {
-        qCWarning(KRDP) << "Failed to create graphics pipeline context";
+        qCWarning(KRDP) << "Failed creating RDPGFX context";
         return false;
     }
 
-    d->gfxContext->custom = this;
     d->gfxContext->ChannelIdAssigned = gfxChannelIdAssigned;
     d->gfxContext->CapsAdvertise = gfxCapsAdvertise;
     d->gfxContext->FrameAcknowledge = gfxFrameAcknowledge;
     d->gfxContext->QoeFrameAcknowledge = gfxQoEFrameAcknowledge;
+
+    d->gfxContext->custom = this;
     d->gfxContext->rdpcontext = d->session->rdpPeerContext();
 
-    if (!d->gfxContext->Initialize(d->gfxContext.get(), FALSE)) {
-        qCWarning(KRDP) << "Failed to initialize graphics pipeline context";
-        d->gfxContext.reset();
+    if (!d->gfxContext->Open(d->gfxContext.get())) {
+        qCWarning(KRDP) << "Could not open GFX context";
         return false;
     }
-
-    d->progressive.reset(progressive_context_new(TRUE));
-    if (!d->progressive) {
-        qCWarning(KRDP) << "Failed to create progressive codec context";
-        d->gfxContext.reset();
-        return false;
-    }
-
-    d->initialized = true;
-
-    connect(d->session->networkDetection(), &NetworkDetection::rttChanged, this, &VideoStream::updateRequestedFrameRate);
 
     d->frameSubmissionThread = std::jthread([this](std::stop_token token) {
         while (!token.stop_requested()) {
-            if (!hasInFlightCapacity() || !d->gfxContext || !d->capsConfirmed) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            // Don't dequeue frames until the GFX channel is ready. This keeps the
+            // initial keyframe in the queue until CapsAdvertise has completed and
+            // we can actually send it; otherwise the client shows a black screen
+            // until the next keyframe.
+            if (!d->gfxContext || !d->capsConfirmed) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(16));
                 continue;
             }
 
             VideoFrame nextFrame;
             {
                 std::unique_lock lock(d->frameQueueMutex);
-                if (!d->frameQueue.isEmpty()) {
-                    nextFrame = d->frameQueue.takeFirst();
+                auto frameInterval = std::chrono::milliseconds(1000 / std::max(d->requestedFrameRate.load(), 1));
+                d->frameQueueCondition.wait_for(lock, frameInterval, [this, token]() {
+                    return token.stop_requested() || !d->frameQueue.isEmpty();
+                });
+                if (token.stop_requested()) {
+                    break;
                 }
+                if (d->frameQueue.isEmpty()) {
+                    continue;
+                }
+                // Always send in order: every encoded P-frame references the one
+                // before it, so skipping a queued frame would corrupt the client's
+                // decode until the next keyframe. The queue is bounded by
+                // queueFrame() clearing it whenever a new keyframe arrives.
+                nextFrame = d->frameQueue.takeFirst();
             }
-            if (nextFrame.size.isEmpty()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1000) / d->requestedFrameRate.load());
-                continue;
+            if (!sendFrame(nextFrame)) {
+                // Caps were reset between dequeue and send (e.g. a client
+                // re-advertisement); hold the frame rather than lose it. If it
+                // is the initial IDR, losing it means a blank client until the
+                // next keyframe.
+                std::lock_guard lock(d->frameQueueMutex);
+                d->frameQueue.prepend(nextFrame);
             }
-            sendFrame(nextFrame);
         }
     });
 
-    qCDebug(KRDP) << "Video stream initialized with H.264" << (h264Disabled() ? "disabled" : "enabled");
+    qCDebug(KRDP) << "Video stream initialized";
+
+    d->streamingSince = clk::steady_clock::now();
+    d->minPendingAfterAckSinceDecision = std::numeric_limits<int>::max();
+    QMetaObject::invokeMethod(&d->adaptiveTimer, qOverload<>(&QTimer::start), Qt::QueuedConnection);
 
     return true;
 }
 
 void VideoStream::close()
 {
-    if (d->encodedStream) {
-        d->encodedStream->stop();
+    QMetaObject::invokeMethod(&d->adaptiveTimer, &QTimer::stop, Qt::QueuedConnection);
+
+    if (!d->gfxContext) {
+        return;
     }
-    if (d->sourceStream) {
-        d->sourceStream->setActive(false);
-    }
+
+    // Stop the frame submission thread first to prevent use-after-free on
+    // gfxContext during close.
     if (d->frameSubmissionThread.joinable()) {
         d->frameSubmissionThread.request_stop();
+        d->frameQueueCondition.notify_all();
         d->frameSubmissionThread.join();
     }
 
     {
         std::lock_guard lock(d->pendingFramesMutex);
         d->pendingFrames.clear();
+        bumpAtomicMin(d->minPendingAfterAckSinceDecision, 0);
     }
     {
         std::lock_guard lock(d->frameQueueMutex);
         d->frameQueue.clear();
     }
 
-    destroySurface();
-
-    if (d->gfxContext) {
-        if (d->channelOpen) {
-            d->gfxContext->Close(d->gfxContext.get());
-            d->channelOpen = false;
-        }
-        d->gfxContext.reset();
-    }
-    d->activeEncodingMode.reset();
-    d->initialized = false;
+    d->gfxContext->Close(d->gfxContext.get());
+    d->gfxContext.reset();
 
     Q_EMIT closed();
 }
@@ -421,24 +503,20 @@ void VideoStream::queueFrame(const KRdp::VideoFrame &frame)
         return;
     }
 
-    std::lock_guard lock(d->frameQueueMutex);
-    if (d->activeEncodingMode == EncodingMode::H264) {
+    {
+        std::lock_guard lock(d->frameQueueMutex);
+        // A keyframe supersedes everything of its OWN monitor still waiting to
+        // be sent, so that monitor's queue can never grow beyond one keyframe
+        // interval. Never drop anything else: encoded P-frames must be sent in
+        // order, and another monitor's queued frames come from another encoder
+        // whose reference chain this keyframe says nothing about. With a single
+        // surface every frame carries index 0, so this still clears the queue.
         if (frame.isKeyFrame) {
-            d->frameQueue.clear();
+            FrameQueuePolicy::dropSupersededFrames(d->frameQueue, frame.monitorIndex);
         }
         d->frameQueue.append(frame);
-        return;
-    } else if (d->activeEncodingMode == EncodingMode::Progressive) {
-        // for the raster path we only need to keep the latest frame, but accumulate damage
-        QRegion lastDamage;
-        if (!d->frameQueue.isEmpty()) {
-            lastDamage = d->frameQueue.last().damage;
-            d->frameQueue.clear();
-        }
-        KRdp::VideoFrame nextFrame = frame;
-        nextFrame.damage += lastDamage;
-        d->frameQueue.append(std::move(nextFrame));
     }
+    d->frameQueueCondition.notify_one();
 }
 
 void VideoStream::reset()
@@ -458,56 +536,179 @@ void VideoStream::setEnabled(bool enabled)
     }
 
     d->enabled = enabled;
+    if (!enabled) {
+        std::lock_guard lock(d->frameQueueMutex);
+        d->frameQueue.clear();
+    }
     Q_EMIT enabledChanged();
 }
 
-void VideoStream::setStreamingEnabled(bool enabled)
+uint32_t VideoStream::requestedFrameRate() const
 {
-    if (d->streamingEnabled == enabled) {
+    return d->requestedFrameRate;
+}
+
+void VideoStream::setQualityCap(quint8 cap)
+{
+    d->qualityCap = cap;
+    const quint8 current = d->quality.load();
+    const quint8 next = d->adaptiveQuality.load() ? std::min(current, cap) : cap;
+    d->quality = next;
+    // Always emit, even when next == current: this is the only path that
+    // tells a brand-new session its quality (SessionController no longer
+    // calls session->setVideoQuality() directly while adaptive quality is on,
+    // to avoid desyncing the encoder from d->quality - see SessionController::
+    // setQuality()/onNewConnection()), and a fresh session needs that push
+    // even when the computed value happens to match VideoStream's default.
+    // The session/KPipeWire chain already no-ops on an unchanged value, so
+    // this costs nothing when it really is a no-op.
+    Q_EMIT requestedQualityChanged(next);
+}
+
+void VideoStream::setMonitorLayout(const QVector<VideoMonitor> &layout)
+{
+    if (!layout.isEmpty()) {
+        const auto primaryCount = std::count_if(layout.cbegin(), layout.cend(), [](const VideoMonitor &monitor) {
+            return monitor.primary;
+        });
+        const bool hasEmptyGeometry = std::any_of(layout.cbegin(), layout.cend(), [](const VideoMonitor &monitor) {
+            return monitor.geometry.isEmpty();
+        });
+
+        if (hasEmptyGeometry || primaryCount != 1 || layout.size() > MaxMonitorLayoutCount) {
+            // A session reports a null output geometry while KWin removes and
+            // re-adds its outputs on a DPMS wake; tearing every surface down
+            // over that is worse than streaming the previous layout until the
+            // session settles. Warn once per run of bad layouts, not per call.
+            if (!d->warnedInvalidLayout) {
+                d->warnedInvalidLayout = true;
+                qCWarning(KRDP) << "Ignoring invalid monitor layout:" << monitorLayoutSummary(layout) << "- keeping the previous one";
+            }
+            return;
+        }
+        d->warnedInvalidLayout = false;
+    }
+
+    std::lock_guard lock(d->layoutMutex);
+    if (d->configuredLayout == layout) {
         return;
     }
 
-    d->streamingEnabled = enabled;
-    if (d->encodedStream) {
-        if (enabled && d->nodeId != 0) {
-            d->encodedStream->start();
-        } else {
-            d->encodedStream->stop();
-        }
+    d->configuredLayout = layout;
+    qCDebug(KRDP) << "Monitor layout configured:" << (layout.isEmpty() ? QStringLiteral("(derived from frames)") : monitorLayoutSummary(layout));
+    // The surfaces are rebuilt from the new layout on the next frame.
+    d->pendingReset = true;
+
+    // A layout change is intentional, unlike the caps re-advertisement storm
+    // the per-index limiter (sendFrame()) exists to bound: reset every entry
+    // so a kept surface's fresh surface after a second layout change within
+    // 2 s of the first still gets its own IDR request.
+    std::fill(d->lastKeyFrameRequest.begin(), d->lastKeyFrameRequest.end(), clk::steady_clock::time_point{});
+
+    // Every queued frame is stamped with an index into the layout that is being
+    // replaced. Sending one after the surfaces are rebuilt would paint a
+    // monitor's picture onto whatever surface now holds that index, or have it
+    // silently dropped by the size guard. The sessions re-open each surface
+    // with a keyframe, so nothing of value is lost by starting from empty.
+    //
+    // Lock order is layoutMutex -> frameQueueMutex, and only ever that way: the
+    // submission thread releases frameQueueMutex before sendFrame() takes
+    // layoutMutex, and queueFrame() takes frameQueueMutex alone.
+    std::lock_guard queueLock(d->frameQueueMutex);
+    d->frameQueue.clear();
+}
+
+void VideoStream::setAdaptiveQuality(bool enabled)
+{
+    if (d->adaptiveQuality.exchange(enabled) == enabled) {
+        return;
     }
-    if (d->sourceStream) {
-        d->sourceStream->setActive(enabled && d->nodeId != 0);
+    if (!enabled) {
+        const quint8 cap = d->qualityCap.load();
+        const quint8 previous = d->quality.exchange(cap);
+        if (previous != cap) {
+            Q_EMIT requestedQualityChanged(cap);
+        }
     }
 }
 
-void VideoStream::setVideoQuality(quint8 quality)
+void VideoStream::setCodecPreference(CodecPreference preference)
 {
-    d->quality = quality;
-    if (d->encodedStream) {
-        d->encodedStream->setQuality(quality);
-    }
+    d->codecPreference = preference;
 }
 
-void VideoStream::setPipeWireSource(quint32 nodeId, int fd)
+CodecPreference VideoStream::codecPreference() const
 {
-    d->nodeId = nodeId;
-    d->pipeWireFd = fd;
-    if (d->encodedStream) {
-        d->encodedStream->setNodeId(nodeId);
-        d->encodedStream->setFd(d->pipeWireFd);
-        if (d->streamingEnabled) {
-            d->encodedStream->start();
-        }
+    return d->codecPreference;
+}
+
+std::optional<VideoCodec> VideoStream::negotiatedCodec() const
+{
+    const int v = d->negotiatedCodec.load();
+    return v < 0 ? std::nullopt : std::optional<VideoCodec>(VideoCodec(v));
+}
+
+VideoCodec VideoStream::codecForSessions() const
+{
+    return negotiatedCodec().value_or(VideoCodecSupport::expectedCodec(d->codecPreference));
+}
+
+void VideoStream::updateAdaptiveQuality()
+{
+    if (!d->adaptiveQuality.load()) {
+        return;
     }
-    if (d->sourceStream) {
-        if (!d->sourceStream->createStream(nodeId, d->pipeWireFd)) {
-            qCWarning(KRDP) << "Could not create PipeWire source stream" << d->sourceStream->error();
-            d->session->close(RdpConnection::CloseReason::VideoInitFailed);
-            return;
-        }
-        d->setSize(this, d->sourceStream->size());
-        d->sourceStream->setActive(d->streamingEnabled);
+    const auto now = clk::steady_clock::now();
+    if (now - d->streamingSince < WarmupAfterStreamStart) {
+        return;
     }
+    if (d->surfacePixels.load() == 0) {
+        return; // no surface yet, nothing is being sent
+    }
+
+    int pendingNow = 0;
+    {
+        std::lock_guard lock(d->pendingFramesMutex);
+        pendingNow = int(d->pendingFrames.size());
+    }
+    const int minAfterAck = d->minPendingAfterAckSinceDecision.exchange(std::numeric_limits<int>::max());
+    // Backlogged = the client never got within BacklogFrames of caught up:
+    // neither after any ack this interval nor right now. Idle (pendingNow 0)
+    // is never a backlog; a stall with no acks at all is (min(INT_MAX, now)).
+    const bool backlogged = std::min(minAfterAck, pendingNow) >= AdaptiveQuality::BacklogFrames;
+
+    auto *network = d->session->networkDetection();
+    const auto averageRtt = clk::duration_cast<clk::microseconds>(network->averageRTT());
+    const auto minimumRtt = clk::duration_cast<clk::microseconds>(network->minimumRTT());
+    const quint8 current = d->quality.load();
+    const auto result = AdaptiveQuality::step({
+        .current = current,
+        .cap = d->qualityCap.load(),
+        .averageRtt = averageRtt,
+        .minimumRtt = minimumRtt,
+        .backlogged = backlogged,
+        .climbAllowed = (now - d->lastStepDown) >= AdaptiveQuality::ClimbHoldAfterStepDown,
+    });
+
+    // The cap or the adaptive-quality flag may have changed while step() ran;
+    // re-check both before committing so a stale result never overshoots a
+    // just-lowered cap or gets applied after adaptive quality was turned off.
+    if (!d->adaptiveQuality.load()) {
+        return;
+    }
+    const quint8 bounded = quint8(std::min<int>(result.next, d->qualityCap.load()));
+    if (bounded < current) {
+        d->lastStepDown = now;
+    }
+    if (bounded == current) {
+        return;
+    }
+
+    d->quality = bounded;
+    qCDebug(KRDP) << "Adaptive quality ->" << bounded << "(" << (result.congested ? "congested" : (backlogged ? "backlogged" : "clear")) << "rtt avg" << averageRtt.count() << "min" << minimumRtt.count()
+                  << "us, pending min-after-ack" << (minAfterAck == std::numeric_limits<int>::max() ? -1 : minAfterAck) << "now" << pendingNow << ", goodput" << network->bandwidth() << "kbit/s, cap"
+                  << d->qualityCap.load() << ")";
+    Q_EMIT requestedQualityChanged(bounded);
 }
 
 bool VideoStream::onChannelIdAssigned(uint32_t channelId)
@@ -526,10 +727,22 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
     if (d->capsConfirmed) {
         qCDebug(KRDP) << "GFX channel reset (re-advertisement), resetting surface state";
         d->capsConfirmed = false;
-        d->pendingReset = true;
-        destroySurface();
+        {
+            // pendingReset belongs with the surfaces it re-arms: this runs on
+            // the peer thread while the submission thread may be inside
+            // sendFrame(), which reads the flag and the surfaces together
+            // under this same lock.
+            // Not configuredLayout: that is configuration, not surface state,
+            // and the next reset rebuilds the surfaces from it.
+            std::lock_guard lock(d->layoutMutex);
+            d->pendingReset = true;
+            d->surfaces.clear();
+            d->monitorLayout.clear();
+        }
+        d->surfacePixels = 0;
         std::lock_guard lock(d->pendingFramesMutex);
         d->pendingFrames.clear();
+        bumpAtomicMin(d->minPendingAfterAckSinceDecision, 0);
     }
 
     auto capsSets = capsAdvertise->capsSets;
@@ -546,7 +759,7 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
         caps.version = set.version;
         caps.capSet = set;
 
-        switch (caps.version) {
+        switch (set.version) {
         case RDPGFX_CAPVERSION_107:
         case RDPGFX_CAPVERSION_106:
         case RDPGFX_CAPVERSION_105:
@@ -571,48 +784,42 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
             break;
         }
 
-        qCDebug(KRDP) << " " << capVersionToString(caps.version) << "flags:" << Qt::hex << set.flags << Qt::dec << "AVC:" << caps.avcSupported
-                      << "YUV420:" << caps.yuv420Supported;
+        qCDebug(KRDP) << " " << capVersionToString(caps.version) << "AVC:" << caps.avcSupported << "YUV420:" << caps.yuv420Supported;
 
         capsInformation.push_back(caps);
     }
 
-    const bool supportsProgresive = !capsInformation.empty();
-
     const bool supportsH264 = std::any_of(capsInformation.begin(), capsInformation.end(), [](const RdpCapsInformation &caps) {
         return caps.avcSupported && caps.yuv420Supported;
     });
-
-    EncodingMode negotiatedMode = EncodingMode::Progressive;
-    if (!h264Disabled() && supportsH264) {
-        negotiatedMode = EncodingMode::H264;
-    } else if (!supportsProgresive) {
-        qCWarning(KRDP) << "Client advertised no usable graphics capability sets";
+    if (!supportsH264) {
+        qCWarning(KRDP) << "Client does not support H.264 in YUV420 mode!";
         d->session->close(RdpConnection::CloseReason::VideoInitFailed);
         return CHANNEL_RC_INITIALIZATION_ERROR;
     }
 
-    QMetaObject::invokeMethod(
-        this,
-        [this, negotiatedMode]() {
-            setActiveEncodingMode(negotiatedMode);
-        },
-        Qt::BlockingQueuedConnection); // RDP callbacks are on the connection thread, VideoStream operates on the main thread
-    qCDebug(KRDP) << "Selected encoding mode:" << encodingModeName(negotiatedMode);
-
-    auto maxVersion = std::max_element(capsInformation.begin(), capsInformation.end(), [](const auto &first, const auto &second) {
+    auto selectedCaps = std::max_element(capsInformation.begin(), capsInformation.end(), [](const auto &first, const auto &second) {
         return first.version < second.version;
     });
 
-    qCDebug(KRDP) << "Selected caps:" << capVersionToString(maxVersion->version);
+    qCDebug(KRDP) << "Selected caps:" << capVersionToString(selectedCaps->version);
+
+    // Not reset to -1 on a re-advertisement (see the capsConfirmed branch above):
+    // the previous codec stays the best guess until the caps parsed just above
+    // settle on a new one a few lines later.
+    const VideoCodec codec = VideoCodecSupport::codecFor(selectedCaps->version, selectedCaps->capSet.flags, d->codecPreference);
+    const int previous = d->negotiatedCodec.exchange(int(codec));
+    qCInfo(KRDP).noquote() << QStringLiteral("GFX caps confirmed: %1 codec=%2").arg(QLatin1String(capVersionToString(selectedCaps->version)), QLatin1String(VideoCodecSupport::codecName(codec)));
+    if (d->codecPreference == CodecPreference::Avc444 && codec == VideoCodec::Avc420) {
+        qCWarning(KRDP) << "Codec=avc444 requested but this client advertises no AVC444 support (caps" << capVersionToString(selectedCaps->version) << "); using avc420";
+    }
+    if (previous != int(codec)) {
+        Q_EMIT negotiatedCodecChanged(codec); // peer thread; the session side connects queued
+    }
 
     RDPGFX_CAPS_CONFIRM_PDU capsConfirmPdu;
-    capsConfirmPdu.capsSet = &(maxVersion->capSet);
-    const UINT status = d->gfxContext->CapsConfirm(d->gfxContext.get(), &capsConfirmPdu);
-    if (status != CHANNEL_RC_OK) {
-        qCWarning(KRDP) << "CapsConfirm failed" << status;
-        return status;
-    }
+    capsConfirmPdu.capsSet = &(selectedCaps->capSet);
+    d->gfxContext->CapsConfirm(d->gfxContext.get(), &capsConfirmPdu);
 
     d->capsConfirmed = true;
 
@@ -631,215 +838,199 @@ uint32_t VideoStream::onFrameAcknowledge(const RDPGFX_FRAME_ACKNOWLEDGE_PDU *fra
         return CHANNEL_RC_OK;
     }
 
-    d->frameDelay = d->encodedFrames - frameAcknowledge->totalFramesDecoded;
     d->pendingFrames.erase(itr);
+
+    // How far behind the client still is now that this ack landed - see
+    // minPendingAfterAckSinceDecision.
+    bumpAtomicMin(d->minPendingAfterAckSinceDecision, int(d->pendingFrames.size()));
 
     return CHANNEL_RC_OK;
 }
 
-void VideoStream::onPacketReceived(const PipeWireEncodedStream::Packet &data)
+bool VideoStream::performReset(const QSize &desktopSize, const QVector<VideoMonitor> &monitors, const QVector<SurfaceLayout::Entry> &surfaces)
 {
-    VideoFrame frameData;
-    frameData.size = d->size;
-    frameData.data = data.data();
-    frameData.isKeyFrame = data.isKeyFrame();
-    queueFrame(frameData);
-}
+    RDPGFX_RESET_GRAPHICS_PDU resetGraphicsPdu;
+    resetGraphicsPdu.width = desktopSize.width();
+    resetGraphicsPdu.height = desktopSize.height();
+    resetGraphicsPdu.monitorCount = monitors.size();
 
-void VideoStream::onFrameReceived(const PipeWireFrame &data)
-{
-    VideoFrame frameData;
-
-    frameData.size = data.dataFrame ? data.dataFrame->size : QSize(data.dmabuf ? data.dmabuf->width : 0, data.dmabuf ? data.dmabuf->height : 0);
-    frameData.damage = data.damage.value_or(QRegion(QRect(QPoint(0, 0), frameData.size)));
-    if (data.presentationTimestamp) {
-        frameData.presentationTimeStamp = clk::system_clock::time_point(clk::duration_cast<clk::microseconds>(*data.presentationTimestamp));
+    auto monitorDefs = std::make_unique<MONITOR_DEF[]>(monitors.size());
+    for (int i = 0; i < monitors.size(); ++i) {
+        const auto &monitor = monitors.at(i);
+        // Inclusive edges: see SurfaceLayout::edgesOf().
+        const auto edges = SurfaceLayout::edgesOf(monitor.geometry);
+        monitorDefs[i].left = edges.left;
+        monitorDefs[i].top = edges.top;
+        monitorDefs[i].right = edges.right;
+        monitorDefs[i].bottom = edges.bottom;
+        monitorDefs[i].flags = monitor.primary ? MONITOR_PRIMARY : 0;
     }
+    resetGraphicsPdu.monitorDefArray = monitorDefs.get();
 
-    if (data.dataFrame) {
-        frameData.image = data.dataFrame->toImage().convertToFormat(QImage::Format_RGB32);
-    } else if (data.dmabuf) {
-        QImage image(frameData.size, QImage::Format_RGBA8888_Premultiplied);
-        if (!d->dmaBufHandler.downloadFrame(image, data)) {
-            qCWarning(KRDP) << "Failed to download DMA-BUF frame";
-            return;
+    qCDebug(KRDP) << "Reset graphics desktop" << desktopSize << "with" << monitors.size() << "monitor(s):" << monitorLayoutSummary(monitors);
+    d->gfxContext->ResetGraphics(d->gfxContext.get(), &resetGraphicsPdu);
+
+    d->surfaces.clear();
+    d->surfaces.reserve(surfaces.size());
+    qint64 totalPixels = 0;
+
+    for (const auto &entry : surfaces) {
+        RDPGFX_CREATE_SURFACE_PDU createSurfacePdu;
+        createSurfacePdu.width = entry.size.width();
+        createSurfacePdu.height = entry.size.height();
+        uint16_t surfaceId = d->nextSurfaceId++;
+        createSurfacePdu.surfaceId = surfaceId;
+        createSurfacePdu.pixelFormat = GFX_PIXEL_FORMAT_XRGB_8888;
+        if (d->gfxContext->CreateSurface(d->gfxContext.get(), &createSurfacePdu) != CHANNEL_RC_OK) {
+            // Sending frames to surfaces the client never created is worse
+            // than sending nothing: roll the whole reset back and let the next
+            // frame retry it.
+            if (!d->loggedCreateSurfaceFailure) {
+                d->loggedCreateSurfaceFailure = true;
+                qCWarning(KRDP) << "CreateSurface failed for a" << entry.size << "surface at" << entry.origin << "- aborting this reset";
+            }
+            d->surfaces.clear();
+            d->surfacePixels = 0;
+            d->pendingReset = true;
+            return false;
         }
-        frameData.image = std::move(image);
-    } else {
-        qCWarning(KRDP) << "PipeWire frame did not contain usable image data";
-        return;
+
+        d->surfaces.push_back(Surface{
+            .id = surfaceId,
+            .size = entry.size,
+            .origin = entry.origin,
+        });
+        totalPixels += qint64(entry.size.width()) * entry.size.height();
+
+        RDPGFX_MAP_SURFACE_TO_OUTPUT_PDU mapSurfaceToOutputPdu;
+        mapSurfaceToOutputPdu.outputOriginX = entry.origin.x();
+        mapSurfaceToOutputPdu.outputOriginY = entry.origin.y();
+        mapSurfaceToOutputPdu.surfaceId = surfaceId;
+        d->gfxContext->MapSurfaceToOutput(d->gfxContext.get(), &mapSurfaceToOutputPdu);
     }
 
-    queueFrame(frameData);
-}
+    d->surfacePixels = totalPixels;
+    // resize() keeps the timestamps of the surfaces that survive this reset,
+    // so a reset storm still cannot ask the encoder for more than one keyframe
+    // per KeyFrameRequestMinInterval per surface.
+    d->lastKeyFrameRequest.resize(surfaces.size());
+    d->loggedCreateSurfaceFailure = false;
 
-bool VideoStream::openChannel()
-{
-    if (!d->gfxContext) {
-        return false;
-    }
-    if (d->channelOpen) {
-        return true;
-    }
-
-    if (!d->gfxContext->Open(d->gfxContext.get())) {
-        qCWarning(KRDP) << "Failed to open RDPGFX dynamic channel";
-        return false;
-    }
-
-    d->channelOpen = true;
     return true;
 }
 
-void VideoStream::destroySurface()
+bool VideoStream::sendFrame(const VideoFrame &frame)
 {
-    if (d->surface.id == 0) {
-        return;
-    }
-
-    if (d->gfxContext && d->surface.codecContextId != 0) {
-        RDPGFX_DELETE_ENCODING_CONTEXT_PDU deleteEncodingContextPdu = {};
-        deleteEncodingContextPdu.surfaceId = d->surface.id;
-        deleteEncodingContextPdu.codecContextId = d->surface.codecContextId;
-        const UINT status = d->gfxContext->DeleteEncodingContext(d->gfxContext.get(), &deleteEncodingContextPdu);
-        if (status != CHANNEL_RC_OK && status != CHANNEL_RC_NOT_INITIALIZED) {
-            qCWarning(KRDP) << "DeleteEncodingContext failed" << status;
-        }
-    }
-
-    if (d->gfxContext) {
-        RDPGFX_DELETE_SURFACE_PDU deleteSurfacePdu = {};
-        deleteSurfacePdu.surfaceId = d->surface.id;
-        const UINT status = d->gfxContext->DeleteSurface(d->gfxContext.get(), &deleteSurfacePdu);
-        if (status != CHANNEL_RC_OK && status != CHANNEL_RC_NOT_INITIALIZED) {
-            qCWarning(KRDP) << "DeleteSurface failed" << status;
-        }
-    }
-
-    if (d->progressive) {
-        progressive_delete_surface_context(d->progressive.get(), d->surface.id);
-    }
-
-    d->surface = Surface{};
-}
-
-void VideoStream::performReset(QSize size)
-{
-    if (!d->gfxContext) {
-        auto settings = d->session->rdpPeerContext()->settings;
-        freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, size.width());
-        freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, size.height());
-        d->session->rdpPeerContext()->update->DesktopResize(d->session->rdpPeerContext());
-        d->surface.size = size;
-        return;
-    }
-
-    destroySurface();
-
-    RDPGFX_RESET_GRAPHICS_PDU resetGraphicsPdu;
-    resetGraphicsPdu.width = size.width();
-    resetGraphicsPdu.height = size.height();
-    resetGraphicsPdu.monitorCount = 1;
-
-    MONITOR_DEF monitor = {};
-    monitor.left = 0;
-    monitor.right = size.width();
-    monitor.top = 0;
-    monitor.bottom = size.height();
-    monitor.flags = MONITOR_PRIMARY;
-    resetGraphicsPdu.monitorDefArray = &monitor;
-    UINT status = d->gfxContext->ResetGraphics(d->gfxContext.get(), &resetGraphicsPdu);
-    if (status != CHANNEL_RC_OK) {
-        qCWarning(KRDP) << "ResetGraphics failed" << status << "for size" << size;
-        return;
-    }
-
-    RDPGFX_CREATE_SURFACE_PDU createSurfacePdu;
-    createSurfacePdu.width = size.width();
-    createSurfacePdu.height = size.height();
-    uint16_t surfaceId = d->nextSurfaceId++;
-    createSurfacePdu.surfaceId = surfaceId;
-    createSurfacePdu.pixelFormat = GFX_PIXEL_FORMAT_XRGB_8888;
-    status = d->gfxContext->CreateSurface(d->gfxContext.get(), &createSurfacePdu);
-    if (status != CHANNEL_RC_OK) {
-        qCWarning(KRDP) << "CreateSurface failed" << status << "surface" << surfaceId << "size" << size;
-        return;
-    }
-
-    d->surface = Surface{
-        .id = surfaceId,
-        .codecContextId = d->activeEncodingMode == EncodingMode::Progressive ? ProgressiveCodecContextId : 0,
-        .size = size,
-    };
-
-    if (d->activeEncodingMode == EncodingMode::Progressive) {
-        if (progressive_create_surface_context(d->progressive.get(), surfaceId, size.width(), size.height()) < 0) {
-            qCWarning(KRDP) << "Failed to create progressive surface context";
-            destroySurface();
-            return;
-        }
-    }
-
-    RDPGFX_MAP_SURFACE_TO_OUTPUT_PDU mapSurfaceToOutputPdu;
-    mapSurfaceToOutputPdu.outputOriginX = 0;
-    mapSurfaceToOutputPdu.outputOriginY = 0;
-    mapSurfaceToOutputPdu.surfaceId = surfaceId;
-    status = d->gfxContext->MapSurfaceToOutput(d->gfxContext.get(), &mapSurfaceToOutputPdu);
-    if (status != CHANNEL_RC_OK) {
-        qCWarning(KRDP) << "MapSurfaceToOutput failed" << status << "surface" << surfaceId;
-        destroySurface();
-        return;
-    }
-}
-
-bool VideoStream::hasInFlightCapacity() const
-{
-    std::lock_guard lock(d->pendingFramesMutex);
-    return d->pendingFrames.size() < MaximumInFlightFrames;
-}
-
-void VideoStream::sendFrame(const VideoFrame &frame)
-{
-    auto peer = d->session->rdpPeer();
-    if (peer->IsWriteBlocked && peer->IsWriteBlocked(peer)) {
-        return;
-    }
-
     if (!d->gfxContext || !d->capsConfirmed) {
-        return;
+        // Not a drop: the caller keeps the frame queued until the channel is ready.
+        return false;
     }
 
-    if (d->pendingReset) {
-        d->pendingReset = false;
-        performReset(frame.size);
-    }
-    if (d->surface.size != frame.size) {
-        performReset(frame.size);
+    if (frame.data.size() == 0) {
+        qCDebug(KRDP) << "Skipping empty encoded frame";
+        return true;
     }
 
-    if (d->activeEncodingMode == EncodingMode::H264) {
-        sendFrameH264(frame);
-    } else if (d->activeEncodingMode == EncodingMode::Progressive) {
-        sendFrameProgressive(frame);
-    }
-}
+    Surface surface;
+    bool requestKeyFrame = false;
+    {
+        std::lock_guard lock(d->layoutMutex);
 
-void VideoStream::sendFrameH264(const VideoFrame &frame)
-{
-    if (frame.data.isEmpty()) {
-        return;
+        const auto plan = planReset(frame, d->configuredLayout);
+        if (frame.monitorIndex < 0 || frame.monitorIndex >= plan.surfaces.size()) {
+            // Nothing sensible to send this to, and resetting would not create
+            // it either. Drop it; the session that produced it is misconfigured.
+            if (!d->loggedUnknownSurface) {
+                d->loggedUnknownSurface = true;
+                qCWarning(KRDP) << "Dropping frames for monitor index" << frame.monitorIndex << "- the layout has" << plan.surfaces.size() << "surface(s)";
+            }
+            return true;
+        }
+
+        const Surface *target = d->surfaceFor(frame.monitorIndex);
+        // With a configured layout the surface sizes come from that layout, so
+        // only a new layout resizes them. Without one the single surface still
+        // follows the frame, exactly as it did before per-monitor surfaces.
+        const bool frameSizeChanged = target && d->configuredLayout.isEmpty() && target->size != frame.size;
+        if (d->pendingReset || d->monitorLayout != plan.monitors || !target || frameSizeChanged) {
+            d->pendingReset = false;
+            d->monitorLayout = plan.monitors;
+            // performReset() sends ResetGraphics, CreateSurface and
+            // MapSurfaceToOutput with layoutMutex held, deliberately. The ack
+            // path (onFrameAcknowledge) never takes this lock, so the only
+            // thread a reset can hold up is the peer thread inside
+            // onCapsAdvertise, which is about to tear these surfaces down
+            // anyway. Dropping the lock around the sends would instead let a
+            // second reset interleave with this one on the wire.
+            if (!performReset(plan.desktopSize, plan.monitors, plan.surfaces)) {
+                // The surfaces were rolled back and pendingReset re-armed.
+                // Drop this frame so the next one retries; holding it would
+                // busy-spin the submission thread, which re-dequeues a
+                // prepended frame with no wait.
+                return true;
+            }
+            Q_EMIT graphicsReset(plan.monitors);
+            target = d->surfaceFor(frame.monitorIndex);
+            // A successful reset is a clean slate: let a later, different
+            // misconfiguration be reported rather than staying silent for the
+            // rest of the stream.
+            d->loggedUnknownSurface = false;
+            d->loggedSizeMismatch = false;
+
+            // A freshly created surface has no reference picture. If the frame we
+            // are about to send is not a keyframe (e.g. after a caps
+            // re-advertisement the queue holds P-frames), ask the session for one
+            // now instead of waiting for the next organic IDR, which on a static
+            // desktop can be seconds away (gop 100, frames only on damage).
+            if (!frame.isKeyFrame) {
+                const auto now = clk::steady_clock::now();
+                auto &lastRequest = d->lastKeyFrameRequest[frame.monitorIndex];
+                if (lastRequest == clk::steady_clock::time_point{} || (now - lastRequest) >= KeyFrameRequestMinInterval) {
+                    lastRequest = now;
+                    requestKeyFrame = true;
+                }
+            }
+        }
+
+        if (!target) {
+            // Unreachable: the index is inside the plan, so either a surface
+            // was already there or performReset just made one. Belt and braces
+            // so a future edit cannot turn this into a null dereference.
+            return true;
+        }
+
+        // With a configured layout the surface is the size that layout asked
+        // for, and a frame of any other size cannot be sent: the surface
+        // command and the AVC420 region rect describe the surface, and
+        // FreeRDP's client-side avc420 decode rejects a region rect larger
+        // than the decoded picture without telling the server anything.
+        if (!d->configuredLayout.isEmpty() && target->size != frame.size) {
+            if (!d->loggedSizeMismatch) {
+                d->loggedSizeMismatch = true;
+                qCWarning(KRDP) << "Dropping frames for monitor" << frame.monitorIndex << ": the frame is" << frame.size << "but its surface is" << target->size
+                                << "- the configured monitor layout must be in pixels, not logical coordinates";
+            }
+            return true;
+        }
+
+        surface = *target;
     }
 
-    if (d->surface.id == 0) {
-        qCWarning(KRDP) << "No graphics surface available for H264 frame submission";
-        return;
+    if (requestKeyFrame) {
+        // Emitted outside the lock: the slot runs on the session's thread, but
+        // signalling under a lock another thread takes is a trap not worth
+        // leaving lying around.
+        qCDebug(KRDP) << "Surface (re)created on a non-keyframe, requesting a keyframe from the encoder for monitor" << frame.monitorIndex;
+        Q_EMIT keyFrameRequested(frame.monitorIndex);
     }
-
-    d->session->networkDetection()->startBandwidthMeasure();
 
     auto frameId = d->frameId++;
 
-    d->encodedFrames++;
+    // Debug-gated (off unless org.kde.krdp.debug is on), but the only place
+    // that shows which monitor a frame actually reached the wire on - the one
+    // thing a multi-monitor stream has to be checked against.
+    qCDebug(KRDP) << "Sending frame" << frameId << "monitorIndex" << frame.monitorIndex << "surface" << surface.id << "at" << surface.origin << surface.size
+                  << (frame.isKeyFrame ? "keyframe" : "delta") << frame.data.size() << "bytes";
 
     {
         std::lock_guard lock(d->pendingFramesMutex);
@@ -855,189 +1046,47 @@ void VideoStream::sendFrameH264(const VideoFrame &frame)
     startFramePdu.frameId = frameId;
     endFramePdu.frameId = frameId;
 
-    RDPGFX_SURFACE_COMMAND surfaceCommand;
-    surfaceCommand.surfaceId = d->surface.id;
+    // The encoder produces a full-frame H.264 picture (KPipeWire does not crop
+    // to damage), so send a single region rect covering the whole surface, as
+    // upstream and gnome-remote-desktop do for AVC420.
+    RDPGFX_SURFACE_COMMAND surfaceCommand = {};
+    surfaceCommand.surfaceId = surface.id;
     surfaceCommand.codecId = RDPGFX_CODECID_AVC420;
-    surfaceCommand.contextId = 0;
     surfaceCommand.format = PIXEL_FORMAT_BGRX32;
+    // Each surface is a whole monitor, so the command covers all of it.
     surfaceCommand.left = 0;
     surfaceCommand.top = 0;
-    surfaceCommand.right = frame.size.width();
-    surfaceCommand.bottom = frame.size.height();
-    surfaceCommand.width = frame.size.width();
-    surfaceCommand.height = frame.size.height();
+    surfaceCommand.right = surface.size.width();
+    surfaceCommand.bottom = surface.size.height();
     surfaceCommand.length = 0;
     surfaceCommand.data = nullptr;
 
-    RDPGFX_AVC420_BITMAP_STREAM avcStream;
+    RDPGFX_AVC420_BITMAP_STREAM avcStream = {};
     surfaceCommand.extra = &avcStream;
-
     avcStream.data = (BYTE *)frame.data.data();
     avcStream.length = frame.data.length();
 
     avcStream.meta.numRegionRects = 1;
-    auto rects = std::make_unique<RECTANGLE_16[]>(1);
-    rects[0].left = 0;
-    rects[0].top = 0;
-    rects[0].right = frame.size.width();
-    rects[0].bottom = frame.size.height();
-    avcStream.meta.regionRects = rects.get();
-    auto qualities = std::make_unique<RDPGFX_H264_QUANT_QUALITY[]>(1);
-    avcStream.meta.quantQualityVals = qualities.get();
-    qualities[0].qp = 22;
-    qualities[0].p = 0;
-    qualities[0].qualityVal = 100;
+    RECTANGLE_16 rect = {0, 0, static_cast<UINT16>(surface.size.width()), static_cast<UINT16>(surface.size.height())};
+    avcStream.meta.regionRects = &rect;
+    // Informational for the client (MS-RDPEGFX 2.2.4.4.1), but keep it honest:
+    // the same map the private KPipeWire uses (quality 100 -> QP 12, 0 -> QP 40).
+    // RDPGFX_H264_QUANT_QUALITY's member order is {qpVal, qualityVal, qp, r, p}
+    // (freerdp/channels/rdpgfx.h) - name the members explicitly rather than
+    // relying on positional aggregate init, which previously put the QP in the
+    // unused qpVal slot (qp itself landed on quality, and qualityVal stayed 0).
+    const quint8 currentQuality = d->quality.load();
+    const quint8 qp = quint8(std::lround(40.0 - 0.28 * currentQuality));
+    RDPGFX_H264_QUANT_QUALITY quality{};
+    quality.qp = qp;
+    quality.qualityVal = currentQuality;
+    avcStream.meta.quantQualityVals = &quality;
 
-    const UINT startStatus = d->gfxContext->StartFrame(d->gfxContext.get(), &startFramePdu);
-    if (startStatus != CHANNEL_RC_OK) {
-        qCWarning(KRDP) << "StartFrame failed" << startStatus << "frameId" << frameId;
-        d->session->networkDetection()->stopBandwidthMeasure();
-        return;
-    }
+    d->gfxContext->StartFrame(d->gfxContext.get(), &startFramePdu);
+    d->gfxContext->SurfaceCommand(d->gfxContext.get(), &surfaceCommand);
+    d->gfxContext->EndFrame(d->gfxContext.get(), &endFramePdu);
 
-    const UINT commandStatus = d->gfxContext->SurfaceCommand(d->gfxContext.get(), &surfaceCommand);
-    if (commandStatus != CHANNEL_RC_OK) {
-        qCWarning(KRDP) << "SurfaceCommand failed" << commandStatus << "frameId" << frameId << "surface" << d->surface.id << "encodedBytes"
-                        << frame.data.size();
-    }
-
-    const UINT endStatus = d->gfxContext->EndFrame(d->gfxContext.get(), &endFramePdu);
-    if (endStatus != CHANNEL_RC_OK) {
-        qCWarning(KRDP) << "EndFrame failed" << endStatus << "frameId" << frameId;
-    }
-
-    d->session->networkDetection()->stopBandwidthMeasure();
-}
-
-void VideoStream::sendFrameProgressive(const VideoFrame &frame)
-{
-    if (frame.image.isNull()) {
-        return;
-    }
-
-    if (d->surface.id == 0) {
-        qCWarning(KRDP) << "No graphics surface available for progressive frame submission";
-        return;
-    }
-
-    QImage image = frame.image.convertToFormat(QImage::Format_RGB32);
-    const QRect frameRect(QPoint(0, 0), image.size());
-    auto invalidRegion = toRegion16(frame.damage, frameRect);
-    if (!invalidRegion) {
-        qCWarning(KRDP) << "Failed to build invalid region for progressive frame";
-        return;
-    }
-
-    BYTE *encodedData = nullptr;
-    UINT32 encodedSize = 0;
-    const UINT32 rectCount = region16_n_rects(&*invalidRegion);
-    const int compressionStatus = progressive_compress(d->progressive.get(),
-                                                       image.constBits(),
-                                                       image.sizeInBytes(),
-                                                       PIXEL_FORMAT_BGRX32,
-                                                       image.width(),
-                                                       image.height(),
-                                                       image.bytesPerLine(),
-                                                       &*invalidRegion,
-                                                       &encodedData,
-                                                       &encodedSize);
-    if (compressionStatus < 0 || !encodedData || encodedSize == 0) {
-        region16_uninit(&*invalidRegion);
-        qCWarning(KRDP) << "Failed to compress progressive frame"
-                        << "status" << compressionStatus << "rects" << rectCount << "size" << frame.size;
-        return;
-    }
-
-    d->session->networkDetection()->startBandwidthMeasure();
-
-    auto frameId = d->frameId++;
-
-    d->encodedFrames++;
-
-    {
-        std::lock_guard lock(d->pendingFramesMutex);
-        d->pendingFrames.insert(frameId);
-    }
-
-    RDPGFX_START_FRAME_PDU startFramePdu;
-    RDPGFX_END_FRAME_PDU endFramePdu;
-
-    auto now = QDateTime::currentDateTimeUtc().time();
-    startFramePdu.timestamp = now.hour() << 22 | now.minute() << 16 | now.second() << 10 | now.msec();
-
-    startFramePdu.frameId = frameId;
-    endFramePdu.frameId = frameId;
-
-    const RECTANGLE_16 *extents = region16_extents(&*invalidRegion);
-
-    RDPGFX_SURFACE_COMMAND surfaceCommand;
-    surfaceCommand.surfaceId = d->surface.id;
-    surfaceCommand.codecId = RDPGFX_CODECID_CAPROGRESSIVE;
-    surfaceCommand.contextId = d->surface.codecContextId;
-    surfaceCommand.format = PIXEL_FORMAT_BGRX32;
-    surfaceCommand.left = extents->left;
-    surfaceCommand.top = extents->top;
-    surfaceCommand.right = extents->right;
-    surfaceCommand.bottom = extents->bottom;
-    surfaceCommand.width = frame.size.width();
-    surfaceCommand.height = frame.size.height();
-    surfaceCommand.length = encodedSize;
-    surfaceCommand.data = encodedData;
-    surfaceCommand.extra = nullptr;
-
-    const UINT status = d->gfxContext->SurfaceFrameCommand(d->gfxContext.get(), &surfaceCommand, &startFramePdu, &endFramePdu);
-    if (status != CHANNEL_RC_OK) {
-        qCWarning(KRDP) << "SurfaceFrameCommand failed" << status << "frameId" << frameId << "surface" << d->surface.id << "encodedBytes" << encodedSize
-                        << "damageRects" << rectCount;
-    }
-
-    d->session->networkDetection()->stopBandwidthMeasure();
-    region16_uninit(&*invalidRegion);
-}
-
-void VideoStream::updateRequestedFrameRate()
-{
-    auto rtt = std::max(clk::duration_cast<clk::milliseconds>(d->session->networkDetection()->averageRTT()), clk::milliseconds(1));
-    auto now = clk::system_clock::now();
-
-    FrameRateEstimate estimate;
-    estimate.timeStamp = now;
-    estimate.estimate = std::min(int(clk::milliseconds(1000) / (rtt * std::max(d->frameDelay.load(), 1))), d->maximumFrameRate);
-    d->frameRateEstimates.append(estimate);
-
-    if (now - d->lastFrameRateEstimation < FrameRateEstimateAveragePeriod) {
-        return;
-    }
-
-    d->lastFrameRateEstimation = now;
-
-    d->frameRateEstimates.erase(std::remove_if(d->frameRateEstimates.begin(),
-                                               d->frameRateEstimates.end(),
-                                               [now](const auto &estimate) {
-                                                   return (estimate.timeStamp - now) > FrameRateEstimateAveragePeriod;
-                                               }),
-                                d->frameRateEstimates.cend());
-
-    auto sum = std::accumulate(d->frameRateEstimates.cbegin(), d->frameRateEstimates.cend(), 0, [](int acc, const auto &estimate) {
-        return acc + estimate.estimate;
-    });
-    auto average = sum / d->frameRateEstimates.size();
-
-    // we want some headroom so we can always clear our current load
-    // and handle any other latency
-    constexpr qreal targetFrameRateSaturation = 0.5;
-    auto frameRate = std::max(1.0, average * targetFrameRateSaturation);
-
-    if (frameRate != d->requestedFrameRate) {
-        d->requestedFrameRate = frameRate;
-        if (d->encodedStream) {
-            d->encodedStream->setMaxFramerate(frameRate, 1);
-            d->encodedStream->setMaxPendingFrames(frameRate);
-        }
-        if (d->sourceStream) {
-            d->sourceStream->setMaxFramerate({static_cast<quint32>(frameRate), 1});
-        }
-    }
+    return true;
 }
 }
 

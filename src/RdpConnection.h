@@ -7,10 +7,12 @@
 #include <memory>
 #include <thread>
 
+#include <QJsonObject>
 #include <QObject>
 
 #include <freerdp/freerdp.h>
 
+#include "ClientDisplayInfo.h"
 #include "krdp_export.h"
 
 namespace KRdp
@@ -22,6 +24,16 @@ class VideoStream;
 class Cursor;
 class NetworkDetection;
 class Clipboard;
+
+/**
+ * Select a VAAPI driver (LIBVA_DRIVER_NAME) for the current configuration.
+ *
+ * Honours KRDP_FORCE_VAAPI_DRIVER / KRDP_AUTO_VAAPI_DRIVER (set from the
+ * VaapiDriverMode config key) and, in auto mode, avoids decode-only NVIDIA
+ * VAAPI backends on mixed-GPU systems. Safe to call at startup and again on
+ * config change; an externally-provided LIBVA_DRIVER_NAME is always respected.
+ */
+KRDP_EXPORT void selectVaapiDriver();
 
 /**
  * An RDP session.
@@ -45,7 +57,6 @@ public:
         Initial,
         Starting,
         Running,
-        Activated,
         Streaming,
         Closed,
     };
@@ -98,7 +109,34 @@ public:
 
     Clipboard *clipboard() const;
 
+    /** The display the client asked for in its connect data. Valid once clientDisplayInfoReceived() fired; a copy, safe from any thread. */
+    ClientDisplay::Info clientDisplayInfo() const;
+    /** Emitted on the session thread, once per connection, at the end of the capabilities exchange. Connect with Qt::QueuedConnection. */
+    Q_SIGNAL void clientDisplayInfoReceived();
+
     NetworkDetection *networkDetection() const;
+
+    /**
+     * Whether the client has a usable `KRDPCTL` static virtual channel (slice
+     * 2c layout control, OPT-044): it joined it and the server-side open
+     * succeeded. Known once the MCS channel join is done, which precedes the
+     * capabilities exchange: valid from the moment clientDisplayInfoReceived()
+     * fires. Safe from any thread.
+     */
+    bool hasControlChannel() const;
+    /**
+     * Send one `KRDPCTL` record (framed by LayoutControl::frame()). Callable
+     * from any thread: the write only queues the data with FreeRDP's channel
+     * manager, and the session thread's loop puts it on the wire. Dropped,
+     * with a warning, when the client has no control channel or the
+     * connection is already closed.
+     */
+    void sendControlRecord(const QJsonObject &record);
+    /**
+     * One complete `KRDPCTL` record from the client. Emitted on the session
+     * thread; connect with Qt::QueuedConnection.
+     */
+    Q_SIGNAL void controlRecordReceived(const QJsonObject &record);
 
 private:
     friend BOOL peerCapabilities(freerdp_peer *);
@@ -123,6 +161,10 @@ private:
     bool onPostConnect();
     bool onClose();
     bool onSuppressOutput(uint8_t allow);
+    /** Session thread: open `KRDPCTL` once the client has joined it. */
+    void openControlChannel();
+    /** Session thread: hand every queued `KRDPCTL` message to the deframer. False on a protocol violation. */
+    bool readControlChannel();
 
     class Private;
     const std::unique_ptr<Private> d;

@@ -8,14 +8,19 @@
 #include <QMimeData>
 #include <QMouseEvent>
 #include <QQueue>
+#include <QRect>
 
 #include <linux/input.h>
+#include <chrono>
+#include <optional>
+#include <utility>
 
 #include <KConfigGroup>
 #include <KSharedConfig>
 #include <KSystemClipboard>
 
 #include "PortalSession_p.h"
+#include "VideoFrame.h"
 #include "krdp_logging.h"
 #include "xdp_dbus_remotedesktop_interface.h"
 #include "xdp_dbus_screencast_interface.h"
@@ -30,6 +35,44 @@ static const QString dbusPath = QStringLiteral("/org/freedesktop/portal/desktop"
 static const QString dbusRequestInterface = QStringLiteral("org.freedesktop.portal.Request");
 static const QString dbusResponse = QStringLiteral("Response");
 static const QString dbusSessionInterface = QStringLiteral("org.freedesktop.portal.Session");
+
+namespace
+{
+QRegion fullFrameDamage(const QSize &size)
+{
+    if (size.isEmpty()) {
+        return {};
+    }
+    return QRegion(QRect(QPoint(0, 0), size));
+}
+
+template<typename Stream>
+void setFullColorRangeIfSupported(Stream *stream)
+{
+    if constexpr (requires(Stream *s) {
+                      s->setColorRange(typename Stream::ColorRange{});
+                      Stream::ColorRange::Full;
+                  }) {
+        stream->setColorRange(Stream::ColorRange::Full);
+    }
+}
+
+template<typename Stream>
+void setPreferredH264Encoder(Stream *stream)
+{
+    auto encoder = PipeWireEncodedStream::H264Baseline;
+    if constexpr (requires(Stream *s) {
+                      s->suggestedEncoders();
+                  }) {
+        const auto suggested = stream->suggestedEncoders();
+        if (suggested.contains(PipeWireEncodedStream::H264Main)) {
+            encoder = PipeWireEncodedStream::H264Main;
+        }
+    }
+    stream->setEncoder(encoder);
+    qCDebug(KRDP) << "Using PipeWire H264 encoder profile:" << (encoder == PipeWireEncodedStream::H264Main ? "Main" : "Baseline");
+}
+}
 
 const QDBusArgument &operator>>(const QDBusArgument &arg, PortalSessionStream &stream)
 {
@@ -78,9 +121,17 @@ public:
     std::unique_ptr<OrgFreedesktopPortalRemoteDesktopInterface> remoteInterface;
     std::unique_ptr<OrgFreedesktopPortalScreenCastInterface> screencastInterface;
 
-    bool ignoreNextSystemClipboardChange = false;
+    // Guard the KSystemClipboard::changed handler against the server's own
+    // write of client-originated data; the changed signal is emitted
+    // synchronously inside setMimeData() (KGuiAddons 6.24), so the flag set
+    // across the write and cleared after it drops the echo, and lastClientText
+    // is the belt for a later asynchronous changed carrying the same bytes.
+    // (Replaces the dead ignoreNextSystemClipboardChange member.)
+    bool writingClientClipboard = false;
+    QString lastClientText;
 
     QDBusObjectPath sessionPath;
+    QVector<VideoMonitor> monitorLayout;
 };
 
 QString createHandleToken()
@@ -100,27 +151,27 @@ PortalSession::PortalSession()
             return;
         }
 
+        // Do not announce the server's own write of the client's clipboard
+        // back to the client (the announce storm; see side-clipboard-plasma).
+        if (d->writingClientClipboard) {
+            return;
+        }
+
         auto data = KSystemClipboard::instance()->mimeData(mode);
         if (!data) {
             return;
         }
 
-        qCDebug(KRDP) << "Clipboard formats:" << data->formats() << "hasText:" << data->hasText();
+        if (data->hasText() && data->text() == d->lastClientText) {
+            return;
+        }
 
-        // KSystemClipboard takes ownership of any QMimeData passed to it but
-        // does not relinquish ownership over anything it returns. So manually
-        // copy over the contents to a new instance of QMimeData so we can keep
-        // the semantics the same.
-        //
-        // Only copy text data here. Fetching arbitrary clipboard MIME payloads
-        // can block for a long time on Wayland/XWayland targets such as
-        // SAVE_TARGETS, which freezes the server's main thread. The RDP
-        // clipboard implementation currently only exposes text anyway.
+        // Keep an owned snapshot, but only fetch the text that cliprdr sends.
+        // Eagerly reading every Wayland MIME payload blocks the main thread
+        // on image conversions and unavailable formats (KDE bug 520175).
         auto newData = new QMimeData();
         if (data->hasText()) {
             newData->setText(data->text());
-        } else {
-            qCDebug(KRDP) << "Ignoring non-text clipboard update with formats" << data->formats();
         }
 
         Q_EMIT clipboardDataChanged(newData);
@@ -134,11 +185,10 @@ PortalSession::PortalSession()
 
 PortalSession::~PortalSession()
 {
+    // Upstream 5976316: setup may have failed before a portal session exists.
     if (d->sessionPath.path().isEmpty()) {
-        qCDebug(KRDP) << "No portal session to close (session was never created)";
         return;
     }
-
     // Make sure to clear any modifier keys that were pressed when the session closed, otherwise
     // we risk those keys getting stuck and the original session becoming unusable.
     for (auto keycode : {KEY_LEFTCTRL, KEY_RIGHTCTRL, KEY_LEFTSHIFT, KEY_RIGHTSHIFT, KEY_LEFTALT, KEY_RIGHTALT, KEY_LEFTMETA, KEY_RIGHTMETA}) {
@@ -165,7 +215,8 @@ void PortalSession::start()
 
 void PortalSession::sendEvent(const std::shared_ptr<QEvent> &event)
 {
-    if (!isStarted()) {
+    auto encodedStream = stream();
+    if (!encodedStream || !encodedStream->isActive()) {
         return;
     }
 
@@ -192,7 +243,7 @@ void PortalSession::sendEvent(const std::shared_ptr<QEvent> &event)
         auto me = std::static_pointer_cast<QMouseEvent>(event);
         auto position = me->position();
         auto logicalPosition = QPointF{(position.x() / size().width()) * logicalSize().width(), (position.y() / size().height()) * logicalSize().height()};
-        d->remoteInterface->NotifyPointerMotionAbsolute(d->sessionPath, QVariantMap{}, nodeId(), logicalPosition.x(), logicalPosition.y());
+        d->remoteInterface->NotifyPointerMotionAbsolute(d->sessionPath, QVariantMap{}, encodedStream->nodeId(), logicalPosition.x(), logicalPosition.y());
         break;
     }
     case QEvent::Wheel: {
@@ -224,12 +275,18 @@ void PortalSession::sendEvent(const std::shared_ptr<QEvent> &event)
 
 void PortalSession::setClipboardData(std::unique_ptr<QMimeData> data)
 {
+    // Remember what the client sent so the changed handler can drop the echo
+    // this write triggers (see the KSystemClipboard::changed connection).
+    d->lastClientText = data && data->hasText() ? data->text() : QString();
+
+    d->writingClientClipboard = true;
     // KSystemClipboard takes ownership
     if (data) {
         KSystemClipboard::instance()->setMimeData(data.release(), QClipboard::Clipboard);
     } else {
         KSystemClipboard::instance()->clear(QClipboard::Clipboard);
     }
+    d->writingClientClipboard = false;
 }
 
 void PortalSession::onCreateSession(uint code, const QVariantMap &result)
@@ -280,9 +337,9 @@ void PortalSession::onDevicesSelected(uint code, const QVariantMap & /*result*/)
         parameters = {{QStringLiteral("types"), 4u}}; // VIRTUAL
     } else {
         parameters = {{QStringLiteral("types"), 1u}, // MONITOR
-                      {QStringLiteral("multiple"), activeStream().has_value()}};
+                      {QStringLiteral("multiple"), activeStream() >= 0}};
+    parameters[QStringLiteral("cursor_mode")] = 4u; // Upstream: cursor metadata
     }
-    parameters[QStringLiteral("cursor_mode")] = 4u; // Metadata
 
     new PortalRequest(d->screencastInterface->SelectSources(d->sessionPath, parameters), this, &PortalSession::onSourcesSelected);
 }
@@ -331,18 +388,30 @@ void KRdp::PortalSession::onSessionStarted(uint code, const QVariantMap &result)
         if (reply.isValid()) {
             qCDebug(KRDP) << "Started Freedesktop Portal session";
 
-            auto streamIndex = activeStream().value_or(0);
-            if (streamIndex >= streams.size()) {
+            if (activeStream() >= streams.size()) {
                 qCWarning(KRDP) << "Requested monitor index out of range, using first monitor";
                 setActiveStream(0);
-                streamIndex = 0;
             }
-            auto stream = streams.at(streamIndex);
+            auto stream = streams.at(activeStream() >= 0 ? activeStream() : 0);
 
             setLogicalSize(qdbus_cast<QSize>(stream.map.value(u"size"_s)));
+            d->monitorLayout = {
+                VideoMonitor{
+                    .geometry = QRect(QPoint(0, 0), logicalSize()),
+                    .primary = true,
+                },
+            };
             auto fd = reply.value();
-            setNodeId(stream.nodeId);
-            setPipeWireFd(fd.takeFileDescriptor());
+            auto encodedStream = this->stream();
+            encodedStream->setNodeId(stream.nodeId);
+            encodedStream->setFd(fd.takeFileDescriptor());
+            encodedStream->setEncodingPreference(PipeWireBaseEncodedStream::EncodingPreference::Speed);
+            // Ensure we encode in full color range when the KPipeWire API supports it.
+            setFullColorRangeIfSupported(encodedStream);
+            setPreferredH264Encoder(encodedStream);
+            connect(encodedStream, &PipeWireEncodedStream::newPacket, this, &PortalSession::onPacketReceived);
+            connect(encodedStream, &PipeWireEncodedStream::sizeChanged, this, &PortalSession::setSize);
+            connect(encodedStream, &PipeWireEncodedStream::cursorChanged, this, &PortalSession::cursorUpdate);
             QDBusConnection::sessionBus().connect(u"org.freedesktop.portal.Desktop"_s,
                                                   d->sessionPath.path(),
                                                   u"org.freedesktop.portal.Session"_s,
@@ -364,6 +433,28 @@ void PortalSession::onSessionClosed()
     qCWarning(KRDP) << "Portal session was closed!";
     Q_EMIT error();
 }
+
+void PortalSession::onPacketReceived(const PipeWireEncodedStream::Packet &data)
+{
+    // KPipeWire's encoded stream carries no per-frame damage, so every packet is
+    // a full-frame update.
+    VideoFrame frameData;
+    frameData.size = size();
+    frameData.data = data.data();
+    frameData.isKeyFrame = data.isKeyFrame();
+    frameData.monitors = d->monitorLayout;
+    frameData.damage = fullFrameDamage(frameData.size);
+
+    if (frameData.monitors.isEmpty() && !frameData.size.isEmpty()) {
+        frameData.monitors.push_back(VideoMonitor{
+            .geometry = QRect(QPoint(0, 0), frameData.size),
+            .primary = true,
+        });
+    }
+
+    Q_EMIT frameReceived(frameData);
+}
+
 }
 
 #include "moc_PortalSession_p.cpp"

@@ -39,6 +39,22 @@ public:
 
     Q_SIGNAL void rttChanged();
 
+    /**
+     * Measured goodput of the connection in kbit/s, exponentially smoothed.
+     * 0 until the first bandwidth measurement has completed.
+     */
+    Q_PROPERTY(quint32 bandwidth READ bandwidth NOTIFY bandwidthChanged)
+    quint32 bandwidth() const;
+    Q_SIGNAL void bandwidthChanged();
+
+    /**
+     * Number of bandwidth measurements that passed the minimum-duration/size
+     * sanity check (see onBandwidthMeasureResults()) since the connection
+     * started. Callers that steer quality from bandwidth() should wait for
+     * a few of these before trusting the estimate.
+     */
+    int validBandwidthSamples() const;
+
     void initialize();
 
     void startBandwidthMeasure();
@@ -51,7 +67,7 @@ private:
     friend BOOL bwMeasureResults(rdpAutoDetect *, RDP_TRANSPORT_TYPE, uint16_t, uint16_t, uint32_t, uint32_t);
 
     bool onRttMeasureResponse(uint16_t sequence);
-    bool onBandwidthMeasureResults();
+    bool onBandwidthMeasureResults(uint32_t timeDelta, uint32_t byteCount);
 
     void updateAverageRtt();
 

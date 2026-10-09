@@ -4,23 +4,25 @@
 
 #pragma once
 
+#include <chrono>
 #include <memory>
 
-#include <QImage>
-#include <QObject>
-#include <QPoint>
+#include <QByteArray>
 #include <QRegion>
 #include <QSize>
+#include <QVector>
 
-#include "krdp_export.h"
+#include "SurfaceLayout.h"
 
 namespace KRdp
 {
 
-class RdpConnection;
-
 /**
  * A frame of compressed video data.
+ *
+ * This is the single definition; VideoStream.h includes it. It used to be
+ * duplicated there, which quietly gave PortalSession.cpp (the only direct
+ * includer of this header) a VideoFrame without monitorIndex.
  */
 struct VideoFrame {
     /**
@@ -32,10 +34,6 @@ struct VideoFrame {
      */
     QByteArray data;
     /**
-     * Raw frame data for classic raster updates.
-     */
-    QImage image;
-    /**
      * Area of the frame that was actually damaged.
      * TODO: Actually use this information.
      */
@@ -43,10 +41,19 @@ struct VideoFrame {
     /**
      * Whether the packet contains all the information
      */
-    bool isKeyFrame = false;
+    bool isKeyFrame;
+    /**
+     * Logical monitor layout mapped into this frame's coordinate space.
+     */
+    QVector<VideoMonitor> monitors;
+    /**
+     * Index of the surface this frame belongs to (0 unless MonitorMode=multi).
+     */
+    int monitorIndex = 0;
     /**
      * When was this frame presented.
      */
     std::chrono::system_clock::time_point presentationTimeStamp;
 };
+
 }

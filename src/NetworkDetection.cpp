@@ -11,6 +11,8 @@
 
 #include <ranges>
 
+#include <atomic>
+
 #include <QQueue>
 #include <QTimer>
 
@@ -27,6 +29,17 @@ namespace clk = std::chrono;
 constexpr auto rttUpdateInterval = clk::milliseconds(70);
 constexpr auto rttAverageInterval = clk::milliseconds(500);
 constexpr auto networkResultInterval = clk::seconds(1);
+constexpr double bandwidthSmoothingWeight = 0.5;
+// Goodput is measured over a scheduled window rather than bracketed around a
+// single frame send: a single frame is far too short a sample (a few hundred
+// bytes over ~1 ms reads as either near-zero or many-hundred-Mbit/s goodput,
+// see research.md OPT-016). Matches upstream krdp's NetworkDetection.
+constexpr auto bandwidthMeasureDuration = clk::milliseconds(500);
+constexpr auto bandwidthMeasureInterval = clk::seconds(2);
+// A sample shorter than this or carrying fewer bytes than this is too noisy
+// to trust (see onBandwidthMeasureResults()).
+constexpr uint32_t minimumBandwidthSampleDuration = 100;
+constexpr uint32_t minimumBandwidthSampleBytes = 4096;
 
 BOOL rttMeasureResponse(rdpAutoDetect *rdpAutodetect, RDP_TRANSPORT_TYPE, uint16_t sequence)
 {
@@ -37,10 +50,10 @@ BOOL rttMeasureResponse(rdpAutoDetect *rdpAutodetect, RDP_TRANSPORT_TYPE, uint16
     return FALSE;
 }
 
-BOOL bwMeasureResults(rdpAutoDetect *rdpAutodetect, RDP_TRANSPORT_TYPE, uint16_t, uint16_t, uint32_t, uint32_t)
+BOOL bwMeasureResults(rdpAutoDetect *rdpAutodetect, RDP_TRANSPORT_TYPE, uint16_t, uint16_t, uint32_t timeDelta, uint32_t byteCount)
 {
     auto context = reinterpret_cast<PeerContext *>(rdpAutodetect->context);
-    if (context->networkDetection->onBandwidthMeasureResults()) {
+    if (context->networkDetection->onBandwidthMeasureResults(timeDelta, byteCount)) {
         return TRUE;
     }
     return FALSE;
@@ -64,6 +77,17 @@ public:
     uint32_t sequenceNumber = 0;
 
     uint32_t lastBandwithMeasurement;
+
+    double smoothedBandwidthBps = 0.0;
+    bool hasSmoothedBandwidth = false;
+    std::atomic<uint32_t> averageBandwidthBps{0};
+    std::atomic<int> validSamples{0};
+
+    // Bandwidth measurement scheduling (mirrors upstream krdp's
+    // NetworkDetection::update()): a bandwidthMeasureDuration-long window is
+    // opened every bandwidthMeasureInterval while idle.
+    clk::system_clock::time_point bandwidthMeasureStartTime;
+    clk::system_clock::time_point lastBandwidthMeasureStart;
 
     bool rttEnabled = false;
     clk::system_clock::time_point lastRttUpdate;
@@ -95,6 +119,18 @@ std::chrono::system_clock::duration NetworkDetection::averageRTT() const
     return d->averageRtt;
 }
 
+quint32 NetworkDetection::bandwidth() const
+{
+    // Compute in 64 bits before narrowing back to kbit/s: averageBandwidthBps
+    // is bytes/s, and multiplying by 8 in 32 bits overflows above ~4.3 Gbit/s.
+    return static_cast<quint32>(static_cast<quint64>(d->averageBandwidthBps.load()) * 8 / 1000);
+}
+
+int NetworkDetection::validBandwidthSamples() const
+{
+    return d->validSamples.load();
+}
+
 void NetworkDetection::initialize()
 {
     d->rdpAutodetect = d->session->rdpPeerContext()->autodetect;
@@ -109,6 +145,7 @@ void NetworkDetection::startBandwidthMeasure()
     }
 
     d->state = State::PendingStop;
+    d->bandwidthMeasureStartTime = clk::system_clock::now();
     d->rdpAutodetect->BandwidthMeasureStart(d->rdpAutodetect, RDP_TRANSPORT_TCP, 0);
 }
 
@@ -129,6 +166,17 @@ void NetworkDetection::update()
     }
 
     auto now = clk::system_clock::now();
+
+    // Goodput: run a bandwidthMeasureDuration-long window every
+    // bandwidthMeasureInterval, independent of frame sends (a single frame is
+    // much too short a sample; see the constants above).
+    if (d->state == State::PendingStop && (now - d->bandwidthMeasureStartTime) >= bandwidthMeasureDuration) {
+        stopBandwidthMeasure();
+    } else if (d->state == State::None && (now - d->lastBandwidthMeasureStart) >= bandwidthMeasureInterval) {
+        d->lastBandwidthMeasureStart = now;
+        startBandwidthMeasure();
+    }
+
     if ((now - d->lastRttUpdate) < rttUpdateInterval) {
         return;
     }
@@ -161,13 +209,38 @@ bool NetworkDetection::onRttMeasureResponse(uint16_t sequence)
     return true;
 }
 
-bool NetworkDetection::onBandwidthMeasureResults()
+bool NetworkDetection::onBandwidthMeasureResults(uint32_t timeDelta, uint32_t byteCount)
 {
     if (d->state != State::PendingResults) {
         return true;
     }
 
     d->state = State::None;
+
+    // A single ~500 ms window can still land on a nearly-idle stretch (a few
+    // ACKs, no frame data) or, on a fast link, complete in well under a
+    // millisecond; both produce a byteCount/timeDelta ratio that is noise,
+    // not goodput (see research.md OPT-016 - a production sample of "10
+    // bytes in 1 ms" read as 296 kbit/s and one of "416 bytes in 1 ms" read
+    // as 1.7 Gbit/s). Reject those before they ever reach the smoothing
+    // filter instead of letting them drag it around.
+    if (timeDelta < minimumBandwidthSampleDuration || byteCount < minimumBandwidthSampleBytes) {
+        qCDebug(KRDP) << "Ignoring bandwidth sample:" << byteCount << "bytes in" << timeDelta << "ms";
+        return true;
+    }
+
+    const auto bytesPerSecond = static_cast<uint32_t>((static_cast<uint64_t>(byteCount) * 1000ULL) / static_cast<uint64_t>(timeDelta));
+    if (!d->hasSmoothedBandwidth) {
+        d->hasSmoothedBandwidth = true;
+        d->smoothedBandwidthBps = bytesPerSecond;
+    } else {
+        d->smoothedBandwidthBps = (1.0 - bandwidthSmoothingWeight) * d->smoothedBandwidthBps + bandwidthSmoothingWeight * bytesPerSecond;
+    }
+    d->averageBandwidthBps.store(static_cast<uint32_t>(d->smoothedBandwidthBps));
+    d->validSamples.fetch_add(1);
+    Q_EMIT bandwidthChanged();
+
+    qCDebug(KRDP) << "Bandwidth measurement:" << byteCount << "bytes in" << timeDelta << "ms ->" << bandwidth() << "kbit/s";
 
     if (d->rdpAutodetect->netCharBandwidth <= 0) {
         return true;

@@ -9,10 +9,14 @@
 
 #include "RdpConnection.h"
 
+#include <atomic>
 #include <filesystem>
+#include <mutex>
+#include <optional>
+#include <vector>
 
-#include <fcntl.h>
-
+#include <QDir>
+#include <QFile>
 #include <QHostAddress>
 #include <QStandardPaths>
 #include <QTcpSocket>
@@ -27,6 +31,7 @@
 #include "Clipboard.h"
 #include "Cursor.h"
 #include "InputHandler.h"
+#include "LayoutControl.h"
 #include "NetworkDetection.h"
 #include "PeerContext_p.h"
 #include "Server.h"
@@ -37,6 +42,142 @@
 #include "krdp_logging.h"
 
 namespace fs = std::filesystem;
+
+namespace KRdp
+{
+
+namespace
+{
+struct RenderNodeInfo {
+    QByteArray renderNode;
+    QByteArray vendorId;
+};
+
+QByteArray readTrimmedFile(const QString &path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        return {};
+    }
+    return file.readAll().trimmed();
+}
+
+QByteArray preferredIntelDriver()
+{
+    constexpr auto iHdDriverPath = "/usr/lib/x86_64-linux-gnu/dri/iHD_drv_video.so";
+    constexpr auto i965DriverPath = "/usr/lib/x86_64-linux-gnu/dri/i965_drv_video.so";
+    if (QFile::exists(QLatin1StringView(iHdDriverPath))) {
+        return "iHD";
+    }
+    if (QFile::exists(QLatin1StringView(i965DriverPath))) {
+        return "i965";
+    }
+    return "iHD";
+}
+
+std::vector<RenderNodeInfo> renderNodes()
+{
+    std::vector<RenderNodeInfo> nodes;
+    const QDir driDir(QStringLiteral("/dev/dri"));
+    const auto entries = driDir.entryList({QStringLiteral("renderD*")}, QDir::System | QDir::Readable, QDir::Name);
+    nodes.reserve(entries.size());
+
+    for (const auto &entry : entries) {
+        const auto vendorPath = QStringLiteral("/sys/class/drm/%1/device/vendor").arg(entry);
+        const auto vendorId = readTrimmedFile(vendorPath);
+        if (vendorId.isEmpty()) {
+            continue;
+        }
+
+        nodes.push_back(RenderNodeInfo{
+            .renderNode = QFile::encodeName(driDir.absoluteFilePath(entry)),
+            .vendorId = vendorId,
+        });
+    }
+
+    return nodes;
+}
+
+QByteArray preferredMixedGpuDriver(const std::vector<RenderNodeInfo> &nodes)
+{
+    bool hasNvidia = false;
+    bool hasAmd = false;
+    bool hasIntel = false;
+
+    for (const auto &node : nodes) {
+        hasNvidia = hasNvidia || (node.vendorId == "0x10de");
+        hasAmd = hasAmd || (node.vendorId == "0x1002" || node.vendorId == "0x1022");
+        hasIntel = hasIntel || (node.vendorId == "0x8086");
+    }
+
+    if (!hasNvidia) {
+        return {};
+    }
+    if (hasAmd) {
+        return "radeonsi";
+    }
+    if (hasIntel) {
+        return preferredIntelDriver();
+    }
+    return {};
+}
+
+QString vendorSummary(const std::vector<RenderNodeInfo> &nodes)
+{
+    QStringList values;
+    values.reserve(nodes.size());
+    for (const auto &node : nodes) {
+        values.push_back(QStringLiteral("%1=%2").arg(QString::fromLatin1(node.renderNode), QString::fromLatin1(node.vendorId)));
+    }
+    return values.join(QStringLiteral(", "));
+}
+
+// Tracks whether the value currently in LIBVA_DRIVER_NAME was set by us, so a
+// later config change can replace our own choice while an externally-provided
+// value is always left untouched.
+bool g_autoAppliedVaapiDriver = false;
+
+// The layout control static virtual channel (slice 2c, OPT-044). Seven
+// characters: CHANNEL_NAME_LEN is the limit for a static channel name.
+char ControlChannelName[] = "KRDPCTL";
+}
+}
+
+void KRdp::selectVaapiDriver()
+{
+    if (qEnvironmentVariableIsSet("LIBVA_DRIVER_NAME") && !g_autoAppliedVaapiDriver) {
+        // Respect an externally-provided driver.
+        return;
+    }
+
+    if (qEnvironmentVariableIsSet("KRDP_FORCE_VAAPI_DRIVER")) {
+        const auto forcedDriver = qgetenv("KRDP_FORCE_VAAPI_DRIVER");
+        if (!forcedDriver.isEmpty()) {
+            qputenv("LIBVA_DRIVER_NAME", forcedDriver);
+            g_autoAppliedVaapiDriver = true;
+            qCInfo(KRDP) << "Using forced VAAPI driver from KRDP_FORCE_VAAPI_DRIVER:" << forcedDriver;
+        }
+        return;
+    }
+    if (qEnvironmentVariableIntValue("KRDP_AUTO_VAAPI_DRIVER") == 0 && qEnvironmentVariableIsSet("KRDP_AUTO_VAAPI_DRIVER")) {
+        qCDebug(KRDP) << "Skipping automatic VAAPI driver selection due to KRDP_AUTO_VAAPI_DRIVER=0";
+        return;
+    }
+
+    const auto nodes = renderNodes();
+    if (nodes.empty()) {
+        return;
+    }
+
+    const auto driver = preferredMixedGpuDriver(nodes);
+    if (driver.isEmpty()) {
+        return;
+    }
+
+    qputenv("LIBVA_DRIVER_NAME", driver);
+    g_autoAppliedVaapiDriver = true;
+    qCInfo(KRDP) << "Auto-selected VAAPI driver" << driver << "based on render-node vendors:" << vendorSummary(nodes);
+}
 
 namespace KRdp
 {
@@ -210,6 +351,22 @@ public:
     freerdp_peer *peer = nullptr;
 
     std::jthread thread;
+
+    std::mutex clientDisplayMutex;
+    ClientDisplay::Info clientDisplay;
+
+    // KRDPCTL (OPT-044). The handle is opened and read on the session
+    // thread; sendControlRecord() writes through it from any thread, so the
+    // mutex orders those writes against the close in onClose().
+    std::mutex controlChannelMutex;
+    HANDLE controlChannel = nullptr;
+    // Session thread only: the join was seen and the open attempted, once.
+    bool controlChannelTried = false;
+    // Whether the client has a usable control channel (joined AND opened);
+    // set on the session thread before clientDisplayInfoReceived() is
+    // emitted, read from wherever.
+    std::atomic<bool> controlChannelOpen = false;
+    LayoutControl::Deframer controlDeframer;
 };
 
 RdpConnection::RdpConnection(Server *server, qintptr socketHandle)
@@ -236,10 +393,7 @@ RdpConnection::RdpConnection(Server *server, qintptr socketHandle)
 
 RdpConnection::~RdpConnection()
 {
-    // Close the peer first to unblock WaitForMultipleObjects in the
-    // run thread. Without this, thread.join() can deadlock when the
-    // session is not in the Streaming state but the thread is still
-    // blocked waiting for socket events.
+    // Upstream 231bec4: unblock the peer thread in every connection state.
     if (d->peer) {
         d->peer->Close(d->peer);
     }
@@ -250,8 +404,7 @@ RdpConnection::~RdpConnection()
     }
 
     if (d->peer) {
-        // freerdp_peer_free() does not free the context allocated by
-        // freerdp_peer_context_new_ex().
+        // Upstream 125d8de: the peer does not own/free its context.
         freerdp_peer_context_free(d->peer);
         freerdp_peer_free(d->peer);
     }
@@ -307,9 +460,110 @@ Clipboard *RdpConnection::clipboard() const
     return d->clipboard.get();
 }
 
+ClientDisplay::Info RdpConnection::clientDisplayInfo() const
+{
+    std::lock_guard lock(d->clientDisplayMutex);
+    return d->clientDisplay;
+}
+
 NetworkDetection *RdpConnection::networkDetection() const
 {
     return d->networkDetection.get();
+}
+
+bool RdpConnection::hasControlChannel() const
+{
+    return d->controlChannelOpen.load();
+}
+
+void RdpConnection::sendControlRecord(const QJsonObject &record)
+{
+    const QByteArray data = LayoutControl::frame(record);
+    std::lock_guard lock(d->controlChannelMutex);
+    if (!d->controlChannel) {
+        qCWarning(KRDP) << "KRDPCTL: dropping a" << record.value(QLatin1String("type")).toString() << "record, the channel is not open";
+        return;
+    }
+    // Only queues the bytes with the channel manager (and wakes the session
+    // thread through its event handle); WTSVirtualChannelManagerCheckFileDescriptor()
+    // in run() is what sends them.
+    ULONG written = 0;
+    if (!WTSVirtualChannelWrite(d->controlChannel, const_cast<char *>(data.constData()), ULONG(data.size()), &written)) {
+        qCWarning(KRDP) << "KRDPCTL: could not queue a" << record.value(QLatin1String("type")).toString() << "record";
+    }
+}
+
+void RdpConnection::openControlChannel()
+{
+    if (d->controlChannelTried) {
+        return;
+    }
+    auto context = reinterpret_cast<PeerContext *>(d->peer->context);
+    if (!WTSVirtualChannelManagerIsChannelJoined(context->virtualChannelManager, ControlChannelName)) {
+        return;
+    }
+    d->controlChannelTried = true;
+    // Opened as soon as the join is visible, well before the client can send
+    // on it (its channel plugins only start after activation): data for a
+    // joined-but-unopened static channel is dropped by FreeRDP, not queued.
+    HANDLE channel = WTSVirtualChannelOpen(context->virtualChannelManager, WTS_CURRENT_SESSION, ControlChannelName);
+    if (!channel) {
+        // Treated as a client without the channel: hasControlChannel() stays
+        // false, so the session build is not held for a record that cannot
+        // arrive.
+        qCWarning(KRDP) << "KRDPCTL: the client joined the channel but it could not be opened; serving it as a client without one";
+        return;
+    }
+    {
+        std::lock_guard lock(d->controlChannelMutex);
+        d->controlChannel = channel;
+    }
+    d->controlChannelOpen = true;
+    qCInfo(KRDP) << "KRDPCTL: channel joined and opened";
+}
+
+bool RdpConnection::readControlChannel()
+{
+    HANDLE channel = nullptr;
+    {
+        std::lock_guard lock(d->controlChannelMutex);
+        channel = d->controlChannel;
+    }
+    if (!channel) {
+        return true;
+    }
+    // The channel manager queues one message per complete channel PDU (the
+    // chunks are reassembled for us); the first call sizes it, the second
+    // takes it. The buffer is never empty even for a zero-length message,
+    // which WTSVirtualChannelRead would otherwise leave queued forever.
+    for (;;) {
+        ULONG length = 0;
+        if (!WTSVirtualChannelRead(channel, 0, nullptr, 0, &length)) {
+            break;
+        }
+        QByteArray buffer(int(qMax<ULONG>(length, 1)), Qt::Uninitialized);
+        ULONG read = 0;
+        if (!WTSVirtualChannelRead(channel, 0, buffer.data(), ULONG(buffer.size()), &read)) {
+            break;
+        }
+        buffer.resize(int(read));
+        d->controlDeframer.feed(buffer);
+        while (auto record = d->controlDeframer.next()) {
+            Q_EMIT controlRecordReceived(*record);
+        }
+        // A payload that is not a JSON object is consumed, not a record: it
+        // never reaches the gate, but the client is told at once rather than
+        // left to wait out the gate's timeout in silence.
+        for (int invalid = d->controlDeframer.takeInvalidCount(); invalid > 0; --invalid) {
+            qCWarning(KRDP) << "KRDPCTL: record payload is not a JSON object; replying error invalid";
+            sendControlRecord(LayoutControl::errorRecord({QStringLiteral("invalid"), QStringLiteral("record payload is not a JSON object")}));
+        }
+        if (d->controlDeframer.overflowed()) {
+            qCWarning(KRDP) << "KRDPCTL: record longer than 64 KiB announced; closing the connection";
+            return false;
+        }
+    }
+    return true;
 }
 
 void RdpConnection::initialize()
@@ -356,6 +610,8 @@ void RdpConnection::initialize()
     freerdp_settings_set_bool(settings, FreeRDP_RdpSecurity, false);
     freerdp_settings_set_bool(settings, FreeRDP_TlsSecurity, true);
     freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, false);
+    // Upstream 4eb3dff: retain the configured TLS/PAM path with FreeRDP 3.32.
+    freerdp_settings_set_bool(settings, FreeRDP_ExtSecurity, false);
 
     freerdp_settings_set_uint32(settings, FreeRDP_OsMajorType, OSMAJORTYPE_UNIX);
     // PSEUDO_XSERVER is apparently required for things to work properly.
@@ -366,15 +622,17 @@ void RdpConnection::initialize()
 
     freerdp_settings_set_uint32(settings, FreeRDP_ColorDepth, 32);
 
+    // The RDPGFX pipeline with H.264. AVC444/AVC444v2 are advertised unless the configuration
+    // pins the codec to AVC420; the codec is chosen per client in VideoStream::onCapsAdvertise().
+    const bool avc444 = d->videoStream->codecPreference() != CodecPreference::Avc420;
     freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline, true);
-    freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, false);
-    freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444v2, false);
-    freerdp_settings_set_bool(settings, FreeRDP_GfxH264, !VideoStream::h264Disabled());
-    freerdp_settings_set_bool(settings, FreeRDP_GfxProgressive, true);
+    freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, avc444);
+    freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444v2, avc444);
+    freerdp_settings_set_bool(settings, FreeRDP_GfxH264, true);
+
 
     freerdp_settings_set_bool(settings, FreeRDP_GfxSmallCache, false);
     freerdp_settings_set_bool(settings, FreeRDP_GfxThinClient, false);
-    freerdp_settings_set_bool(settings, FreeRDP_SupportDynamicChannels, true);
 
     freerdp_settings_set_bool(settings, FreeRDP_HasExtendedMouseEvent, true);
     freerdp_settings_set_bool(settings, FreeRDP_HasHorizontalWheel, true);
@@ -418,8 +676,7 @@ void RdpConnection::run(std::stop_token stopToken)
 {
     auto context = reinterpret_cast<PeerContext *>(d->peer->context);
     auto channelEvent = WTSVirtualChannelManagerGetEventHandle(context->virtualChannelManager);
-    BYTE lastDrdynvcState = 0xFF;
-    bool lastDrdynvcJoined = false;
+
     setState(State::Running);
 
     while (!stopToken.stop_requested()) {
@@ -429,8 +686,11 @@ void RdpConnection::run(std::stop_token stopToken)
             qCDebug(KRDP) << "Unable to get transport event handles";
             break;
         }
-        // Wait for something to happen on the connection.
-        WaitForMultipleObjects(1 + handleCount, events.data(), FALSE, INFINITE);
+        // Bounded, not INFINITE: NetworkDetection::update() (RTT probe every
+        // 70 ms, bandwidth window stop after 500 ms) must run on an idle link
+        // too. Waiting only for socket activity stretched idle bandwidth
+        // windows to 1.0-1.6 s in the 2026-09-16 journal.
+        WaitForMultipleObjects(1 + handleCount, events.data(), FALSE, 100);
 
         // Read data from the socket and have FreeRDP process it.
         if (d->peer->CheckFileDescriptor(d->peer) != TRUE) {
@@ -438,49 +698,40 @@ void RdpConnection::run(std::stop_token stopToken)
             break;
         }
 
-        if (d->peer->connected && d->state == State::Activated) {
-            if (d->videoStream->initialize()) {
-                d->videoStream->setEnabled(true);
-            } else {
-                break;
+        // Initialize any dynamic channels once the dynamic channel channel is setup.
+        if (d->peer->connected && WTSVirtualChannelManagerIsChannelJoined(context->virtualChannelManager, DRDYNVC_SVC_CHANNEL_NAME)) {
+            auto state = WTSVirtualChannelManagerGetDrdynvcState(context->virtualChannelManager);
+            // Dynamic channels can only be set up properly once the dynamic channel channel is properly setup.
+            if (state == DRDYNVC_STATE_READY) {
+                if (d->videoStream->initialize()) {
+                    d->videoStream->setEnabled(true);
+                    setState(State::Streaming);
+                } else {
+                    break;
+                }
+            } else if (state == DRDYNVC_STATE_NONE) {
+                // This ensures that WTSVirtualChannelManagerCheckFileDescriptor() will be called, which initializes the drdynvc channel.
+                SetEvent(channelEvent);
             }
         }
 
-        const bool cliprdrJoined = WTSVirtualChannelManagerIsChannelJoined(context->virtualChannelManager, CLIPRDR_SVC_CHANNEL_NAME);
-        const bool drdynvcJoined = WTSVirtualChannelManagerIsChannelJoined(context->virtualChannelManager, DRDYNVC_SVC_CHANNEL_NAME);
-        const BYTE drdynvcState = WTSVirtualChannelManagerGetDrdynvcState(context->virtualChannelManager);
-
-        if (d->peer->connected && d->state == State::Activated && drdynvcJoined && drdynvcState == DRDYNVC_STATE_NONE) {
-            if (WTSVirtualChannelManagerOpen(context->virtualChannelManager) != TRUE) {
-                qCDebug(KRDP) << "Unable to open Virtual Channel Manager for drdynvc";
-                break;
-            }
-        }
-
-        if (WTSVirtualChannelManagerCheckFileDescriptorEx(context->virtualChannelManager, FALSE) != TRUE) {
+        if (WaitForSingleObject(channelEvent, 0) == WAIT_OBJECT_0 && WTSVirtualChannelManagerCheckFileDescriptor(context->virtualChannelManager) != TRUE) {
             qCDebug(KRDP) << "Unable to check Virtual Channel Manager file descriptor, closing connection";
             break;
         }
 
-        if (d->peer->connected && d->state == State::Activated && cliprdrJoined) {
+        if (d->peer->connected && WTSVirtualChannelManagerIsChannelJoined(context->virtualChannelManager, CLIPRDR_SVC_CHANNEL_NAME)) {
             if (!d->clipboard->initialize()) {
                 break;
             }
         }
 
-        if (drdynvcJoined != lastDrdynvcJoined || drdynvcState != lastDrdynvcState) {
-            lastDrdynvcJoined = drdynvcJoined;
-            lastDrdynvcState = drdynvcState;
-        }
-
-        if (d->peer->connected && d->state == State::Activated && drdynvcJoined) {
-            if (drdynvcState == DRDYNVC_STATE_READY) {
-                if (!d->videoStream->openChannel()) {
-                    qCWarning(KRDP) << "Unable to open RDPGFX channel";
-                } else {
-                    setState(State::Streaming);
-                }
-            }
+        // KRDPCTL (OPT-044): opened as soon as the join shows, not once
+        // connected (see openControlChannel()); the client's records arrive
+        // through CheckFileDescriptor() above, queued on the channel.
+        openControlChannel();
+        if (!readControlChannel()) {
+            break;
         }
 
         d->networkDetection->update();
@@ -493,6 +744,8 @@ void RdpConnection::run(std::stop_token stopToken)
 bool RdpConnection::onCapabilities()
 {
     auto settings = d->peer->context->settings;
+    // We only support GraphicsPipeline clients currently as that is required
+    // for AVC streaming.
     if (!freerdp_settings_get_bool(settings, FreeRDP_SupportGraphicsPipeline)) {
         qCWarning(KRDP) << "Client does not support graphics pipeline which is required";
         return false;
@@ -514,12 +767,36 @@ bool RdpConnection::onCapabilities()
         return false;
     }
 
+    ClientDisplay::Info info;
+    info.desktopSize = QSize(int(freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth)), int(freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight)));
+    const auto monitorCount = freerdp_settings_get_uint32(settings, FreeRDP_MonitorCount);
+    for (UINT32 i = 0; i < monitorCount; ++i) {
+        const auto *monitor = static_cast<const rdpMonitor *>(freerdp_settings_get_pointer_array(settings, FreeRDP_MonitorDefArray, i));
+        if (!monitor) {
+            break;
+        }
+        info.monitors.push_back(VideoMonitor{
+            .geometry = QRect(monitor->x, monitor->y, monitor->width, monitor->height),
+            .primary = monitor->is_primary != 0,
+        });
+    }
+    {
+        std::lock_guard lock(d->clientDisplayMutex);
+        d->clientDisplay = info;
+    }
+    // The MCS channel join is complete by the time FreeRDP asks for the
+    // capabilities, so hasControlChannel() is exact for the slot below.
+    openControlChannel();
+    qCInfo(KRDP) << "Client display: desktop" << info.desktopSize << "monitors" << info.monitors.size()
+                 << "monitorLayoutPdu" << freerdp_settings_get_bool(settings, FreeRDP_SupportMonitorLayoutPdu)
+                 << "KRDPCTL" << d->controlChannelOpen.load();
+    Q_EMIT clientDisplayInfoReceived();
+
     return true;
 }
 
 bool RdpConnection::onActivate()
 {
-    setState(State::Activated);
     return true;
 }
 
@@ -560,6 +837,13 @@ bool RdpConnection::onPostConnect()
 
 bool RdpConnection::onClose()
 {
+    {
+        std::lock_guard lock(d->controlChannelMutex);
+        if (d->controlChannel) {
+            WTSVirtualChannelClose(d->controlChannel);
+            d->controlChannel = nullptr;
+        }
+    }
     d->clipboard->close();
     d->videoStream->close();
     setState(State::Closed);

@@ -6,6 +6,7 @@
 
 #include <QKeyEvent>
 #include <QMetaObject>
+#include <QThread>
 
 #include <xkbcommon/xkbcommon.h>
 
@@ -16,48 +17,59 @@
 namespace KRdp
 {
 
-template<typename ReturnType, typename... MethodArgs, typename... CallArgs>
-static BOOL invokeOnInputHandlerThread(InputHandler *inputHandler, ReturnType (InputHandler::*method)(MethodArgs...), CallArgs &&...args)
-{
-    bool handled = false;
-    QMetaObject::invokeMethod(inputHandler, method, Qt::BlockingQueuedConnection, qReturnArg(handled), std::forward<CallArgs>(args)...);
-
-    return handled ? TRUE : FALSE;
-}
-
 BOOL inputSynchronizeEvent(rdpInput *input, uint32_t flags)
 {
     auto context = reinterpret_cast<PeerContext *>(input->context);
 
-    return invokeOnInputHandlerThread(context->inputHandler, &InputHandler::synchronizeEvent, flags);
+    if (context->inputHandler->synchronizeEvent(flags)) {
+        return TRUE;
+    }
+
+    return FALSE;
 }
 
 BOOL inputMouseEvent(rdpInput *input, uint16_t flags, uint16_t x, uint16_t y)
 {
     auto context = reinterpret_cast<PeerContext *>(input->context);
 
-    return invokeOnInputHandlerThread(context->inputHandler, &InputHandler::mouseEvent, x, y, flags);
+    if (context->inputHandler->mouseEvent(x, y, flags)) {
+        return TRUE;
+    }
+
+    return FALSE;
 }
 
 BOOL inputExtendedMouseEvent(rdpInput *input, uint16_t flags, uint16_t x, uint16_t y)
 {
     auto context = reinterpret_cast<PeerContext *>(input->context);
 
-    return invokeOnInputHandlerThread(context->inputHandler, &InputHandler::extendedMouseEvent, x, y, flags);
+    if (context->inputHandler->extendedMouseEvent(x, y, flags)) {
+        return TRUE;
+    }
+
+    return FALSE;
 }
 
 BOOL inputKeyboardEvent(rdpInput *input, uint16_t flags, uint8_t code)
 {
     auto context = reinterpret_cast<PeerContext *>(input->context);
 
-    return invokeOnInputHandlerThread(context->inputHandler, &InputHandler::keyboardEvent, uint16_t(code), flags);
+    if (context->inputHandler->keyboardEvent(code, flags)) {
+        return TRUE;
+    }
+
+    return FALSE;
 }
 
 BOOL inputUnicodeKeyboardEvent(rdpInput *input, uint16_t flags, uint16_t code)
 {
     auto context = reinterpret_cast<PeerContext *>(input->context);
 
-    return invokeOnInputHandlerThread(context->inputHandler, &InputHandler::unicodeKeyboardEvent, code, flags);
+    if (context->inputHandler->unicodeKeyboardEvent(code, flags)) {
+        return TRUE;
+    }
+
+    return FALSE;
 }
 
 class KRDP_NO_EXPORT InputHandler::Private
@@ -89,14 +101,28 @@ void InputHandler::initialize(rdpInput *input)
     input->UnicodeKeyboardEvent = inputUnicodeKeyboardEvent;
 }
 
-bool InputHandler::synchronizeEvent(uint32_t /*flags*/)
+bool InputHandler::synchronizeEvent(uint32_t flags)
 {
+    if (QThread::currentThread() != thread()) {
+        QMetaObject::invokeMethod(this, [this, flags]() {
+            synchronizeEvent(flags);
+        }, Qt::QueuedConnection);
+        return true;
+    }
+
     // TODO: This syncs caps/num/scroll lock keys, do we actually want to?
     return true;
 }
 
 bool InputHandler::mouseEvent(uint16_t x, uint16_t y, uint16_t flags)
 {
+    if (QThread::currentThread() != thread()) {
+        QMetaObject::invokeMethod(this, [this, x, y, flags]() {
+            mouseEvent(x, y, flags);
+        }, Qt::QueuedConnection);
+        return true;
+    }
+
     QPointF position = QPointF(x, y);
 
     // Track last known mouse position for wheel events from clients
@@ -168,6 +194,13 @@ bool InputHandler::mouseEvent(uint16_t x, uint16_t y, uint16_t flags)
 
 bool InputHandler::extendedMouseEvent(uint16_t x, uint16_t y, uint16_t flags)
 {
+    if (QThread::currentThread() != thread()) {
+        QMetaObject::invokeMethod(this, [this, x, y, flags]() {
+            extendedMouseEvent(x, y, flags);
+        }, Qt::QueuedConnection);
+        return true;
+    }
+
     if (flags & PTR_FLAGS_MOVE) {
         return mouseEvent(x, y, PTR_FLAGS_MOVE);
     }
@@ -195,6 +228,13 @@ bool InputHandler::extendedMouseEvent(uint16_t x, uint16_t y, uint16_t flags)
 
 bool InputHandler::keyboardEvent(uint16_t code, uint16_t flags)
 {
+    if (QThread::currentThread() != thread()) {
+        QMetaObject::invokeMethod(this, [this, code, flags]() {
+            keyboardEvent(code, flags);
+        }, Qt::QueuedConnection);
+        return true;
+    }
+
     auto virtualCode = GetVirtualKeyCodeFromVirtualScanCode(flags & KBD_FLAGS_EXTENDED ? code | KBDEXT : code, 4);
     virtualCode = flags & KBD_FLAGS_EXTENDED ? virtualCode | KBDEXT : virtualCode;
 
@@ -210,6 +250,13 @@ bool InputHandler::keyboardEvent(uint16_t code, uint16_t flags)
 
 bool InputHandler::unicodeKeyboardEvent(uint16_t code, uint16_t flags)
 {
+    if (QThread::currentThread() != thread()) {
+        QMetaObject::invokeMethod(this, [this, code, flags]() {
+            unicodeKeyboardEvent(code, flags);
+        }, Qt::QueuedConnection);
+        return true;
+    }
+
     auto text = QString(QChar::fromUcs2(code));
     auto keysym = xkb_utf32_to_keysym(text.toUcs4().first());
     if (!keysym) {

@@ -8,7 +8,9 @@
 #include "krdpserversettings.h"
 #include <PipeWireRecord>
 
+#include <KConfigGroup>
 #include <KPluginFactory>
+#include <KLocalizedString>
 #include <QClipboard>
 #include <QDBusArgument>
 #include <QDBusConnection>
@@ -20,6 +22,7 @@
 #include <QHostInfo>
 #include <QNetworkInterface>
 #include <QProcess>
+#include <QScreen>
 #include <qt6keychain/keychain.h>
 
 #include "org.freedesktop.impl.portal.PermissionStore.h"
@@ -35,6 +38,35 @@ static const QString dbusKrdpServerServicePath = u"/org/freedesktop/systemd1/uni
 static const QString dbusSystemdUnitInterface = u"org.freedesktop.systemd1.Unit"_s;
 static const QString dbusSystemdManagerInterface = u"org.freedesktop.systemd1.Manager"_s;
 static const QString dbusSystemdPropertiesInterface = u"org.freedesktop.DBus.Properties"_s;
+
+namespace
+{
+bool settingChangeRequiresRestart(const KRDPServerSettings *settings)
+{
+    const KConfigGroup group(KSharedConfig::openConfig(QStringLiteral("krdpserverrc")), QStringLiteral("General"));
+
+    if (group.readEntry(QStringLiteral("ListenPort"), settings->listenPort()) != settings->listenPort()) {
+        return true;
+    }
+    if (group.readEntry(QStringLiteral("AutogenerateCertificates"), settings->autogenerateCertificates()) != settings->autogenerateCertificates()) {
+        return true;
+    }
+    if (group.readEntry(QStringLiteral("Certificate"), settings->certificate()) != settings->certificate()) {
+        return true;
+    }
+    if (group.readEntry(QStringLiteral("CertificateKey"), settings->certificateKey()) != settings->certificateKey()) {
+        return true;
+    }
+    if (group.readEntry(QStringLiteral("Users"), settings->users()) != settings->users()) {
+        return true;
+    }
+    if (group.readEntry(QStringLiteral("SystemUserEnabled"), settings->systemUserEnabled()) != settings->systemUserEnabled()) {
+        return true;
+    }
+
+    return false;
+}
+}
 
 KRDPServerConfig::KRDPServerConfig(QObject *parent, const KPluginMetaData &data)
     : KQuickManagedConfigModule(parent, data)
@@ -164,7 +196,13 @@ bool KRDPServerConfig::userExists(const QString &username)
 
 void KRDPServerConfig::save()
 {
+    const bool restartRequired = settingChangeRequiresRestart(m_serverSettings);
+
     KQuickManagedConfigModule::save();
+    if (m_restartRequiredFromLastSave != restartRequired) {
+        m_restartRequiredFromLastSave = restartRequired;
+        Q_EMIT restartRequiredFromLastSaveChanged();
+    }
     Q_EMIT krdpServerSettingsChanged();
 }
 
@@ -224,6 +262,22 @@ QStringList KRDPServerConfig::listenAddressList()
         }
     }
     return addressList;
+}
+
+QStringList KRDPServerConfig::availableMonitorIds() const
+{
+    QStringList monitors;
+    const auto screens = qGuiApp->screens();
+    monitors.reserve(screens.size());
+
+    auto *primary = qGuiApp->primaryScreen();
+    for (int i = 0; i < screens.size(); ++i) {
+        const auto *screen = screens.at(i);
+        const auto geometry = screen->geometry();
+        const auto primarySuffix = (screen == primary) ? i18nc("@label", " (Primary)") : QString();
+        monitors.push_back(i18nc("@item:inlistbox", "%1: %2 [%3x%4]%5", i, screen->name(), geometry.width(), geometry.height(), primarySuffix));
+    }
+    return monitors;
 }
 
 QString KRDPServerConfig::hostName() const
@@ -392,6 +446,11 @@ bool KRDPServerConfig::isServerRunning() const
 QString KRDPServerConfig::errorMessage() const
 {
     return m_lastErrorMessage;
+}
+
+bool KRDPServerConfig::restartRequiredFromLastSave() const
+{
+    return m_restartRequiredFromLastSave;
 }
 
 void KRDPServerConfig::setErrorMessage(const QString &errorMessage)

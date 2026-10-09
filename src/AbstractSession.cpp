@@ -3,7 +3,14 @@
 // SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
 
 #include "AbstractSession.h"
-#include <unistd.h>
+
+#include <algorithm>
+
+#include <PipeWireEncodedStream>
+#include <PipeWireSourceStream>
+#include <QSet>
+
+#include "krdp_logging.h"
 
 namespace KRdp
 {
@@ -11,13 +18,18 @@ namespace KRdp
 class KRDP_NO_EXPORT AbstractSession::Private
 {
 public:
+    std::unique_ptr<PipeWireEncodedStream> encodedStream;
+
     std::optional<int> activeStream;
     std::optional<VirtualMonitor> virtualMonitor;
     bool started = false;
+    bool enabled = false;
     QSize size;
     QSize logicalSize;
-    quint32 nodeId = 0;
-    int pipeWireFd = -1;
+    std::optional<quint32> frameRate = 60;
+    std::optional<quint8> quality;
+    QSet<QObject *> enableRequests;
+    int monitorIndex = 0;
 };
 
 AbstractSession::AbstractSession()
@@ -28,8 +40,8 @@ AbstractSession::AbstractSession()
 
 AbstractSession::~AbstractSession()
 {
-    if (d->pipeWireFd >= 0) {
-        close(d->pipeWireFd);
+    if (d->encodedStream) {
+        d->encodedStream->stop();
     }
 }
 
@@ -38,9 +50,14 @@ QSize AbstractSession::logicalSize() const
     return d->logicalSize;
 }
 
-std::optional<int> AbstractSession::activeStream() const
+bool AbstractSession::streamingRequested() const
 {
-    return d->activeStream;
+    return d->enabled;
+}
+
+int AbstractSession::activeStream() const
+{
+    return d->activeStream.value_or(-1);
 }
 
 std::optional<VirtualMonitor> AbstractSession::virtualMonitor() const
@@ -60,9 +77,103 @@ void AbstractSession::setVirtualMonitor(const VirtualMonitor &virtualMonitor)
     d->virtualMonitor = virtualMonitor;
 }
 
-bool AbstractSession::isStarted() const
+void AbstractSession::setVideoQuality(quint8 quality)
 {
-    return d->started;
+    d->quality = quality;
+    if (d->encodedStream) {
+        d->encodedStream->setQuality(quality);
+    }
+}
+
+void AbstractSession::refreshDisplayConfiguration()
+{
+}
+
+void AbstractSession::sendGlobalEvent(const std::shared_ptr<QEvent> &event)
+{
+    sendEvent(event);
+}
+
+void AbstractSession::setMonitorIndex(int index)
+{
+    d->monitorIndex = index;
+}
+
+int AbstractSession::monitorIndex() const
+{
+    return d->monitorIndex;
+}
+
+QRect AbstractSession::outputGeometry() const
+{
+    return QRect(QPoint(0, 0), logicalSize());
+}
+
+QPointF AbstractSession::mapToGlobal(const QPointF &local) const
+{
+    const QPoint origin = outputGeometry().topLeft();
+    const QSize pixels = pixelSize();
+    const QSize logical = logicalSize();
+    if (pixels.isEmpty() || logical.isEmpty()) {
+        return local + origin;
+    }
+    // The last pixel of the capture is the last logical unit of the output,
+    // which is why both spans are one less than the size.
+    const auto inputWidth = std::max(1, pixels.width() - 1);
+    const auto inputHeight = std::max(1, pixels.height() - 1);
+    const auto logicalWidth = std::max(1, logical.width() - 1);
+    const auto logicalHeight = std::max(1, logical.height() - 1);
+    const auto normalizedX = std::clamp(local.x() / double(inputWidth), 0.0, 1.0);
+    const auto normalizedY = std::clamp(local.y() / double(inputHeight), 0.0, 1.0);
+    return QPointF{normalizedX * logicalWidth + origin.x(), normalizedY * logicalHeight + origin.y()};
+}
+
+void AbstractSession::requestKeyFrame()
+{
+    qCDebug(KRDP) << "Keyframe requested but this session type cannot obtain one; waiting for the next organic keyframe";
+}
+
+bool AbstractSession::streamActive() const
+{
+    if (d->encodedStream) {
+        return d->encodedStream->isActive();
+    }
+    return false;
+}
+
+// The pre-existing spelling of the same question, kept so nothing outside has
+// to change; there is one implementation, above.
+bool AbstractSession::streamingEnabled() const
+{
+    return streamActive();
+}
+
+void AbstractSession::setStreamingEnabled(bool enable)
+{
+    d->enabled = enable;
+
+    if (enable && !d->started) {
+        start();
+        return;
+    }
+
+    if (d->encodedStream) {
+        if (enable && d->started) {
+            d->encodedStream->start();
+        } else {
+            d->encodedStream->stop();
+        }
+    }
+}
+
+void AbstractSession::setVideoFrameRate(quint32 framerate)
+{
+    d->frameRate = framerate;
+    if (d->encodedStream) {
+        d->encodedStream->setMaxFramerate({framerate, 1});
+        // this buffers 1 second of frames and drops after that
+        d->encodedStream->setMaxPendingFrames(framerate);
+    }
 }
 
 void AbstractSession::setSize(QSize size)
@@ -75,42 +186,60 @@ void AbstractSession::setLogicalSize(QSize size)
     d->logicalSize = size;
 }
 
-QSize AbstractSession::size() const
+QSize AbstractSession::pixelSize() const
 {
     return d->size;
 }
 
-quint32 AbstractSession::nodeId() const
+// The protected spelling subclasses already use; one implementation, above.
+QSize AbstractSession::size() const
 {
-    return d->nodeId;
+    return pixelSize();
 }
 
-int AbstractSession::takePipeWireFd()
+PipeWireEncodedStream *AbstractSession::stream()
 {
-    return std::exchange(d->pipeWireFd, -1);
-}
-
-void AbstractSession::setNodeId(quint32 nodeId)
-{
-    d->nodeId = nodeId;
-}
-
-void AbstractSession::setPipeWireFd(int fd)
-{
-    if (d->pipeWireFd >= 0) {
-        close(d->pipeWireFd);
+    if (!d->encodedStream) {
+        d->encodedStream = std::make_unique<PipeWireEncodedStream>();
+        connect(d->encodedStream.get(), &PipeWireEncodedStream::activeChanged, this, &AbstractSession::streamActiveChanged);
+        if (d->frameRate) {
+            d->encodedStream->setMaxFramerate({d->frameRate.value(), 1});
+        }
+        if (d->quality) {
+            d->encodedStream->setQuality(d->quality.value());
+        }
     }
-    d->pipeWireFd = fd;
+    return d->encodedStream.get();
 }
 
 void AbstractSession::setStarted(bool s)
 {
     d->started = s;
     if (s) {
+        if (d->enabled) {
+            d->encodedStream->start();
+        }
         Q_EMIT started();
     }
 }
 
+void AbstractSession::requestStreamingEnable(QObject *requester)
+{
+    d->enableRequests.insert(requester);
+    connect(requester, &QObject::destroyed, this, &AbstractSession::requestStreamingDisable);
+    setStreamingEnabled(true);
 }
 
-#include "AbstractSession.moc"
+void AbstractSession::requestStreamingDisable(QObject *requester)
+{
+    if (!d->enableRequests.contains(requester)) {
+        return;
+    }
+    disconnect(requester, &QObject::destroyed, this, &AbstractSession::requestStreamingDisable);
+    d->enableRequests.remove(requester);
+    if (d->enableRequests.size() == 0) {
+        setStreamingEnabled(false);
+    }
+}
+
+}

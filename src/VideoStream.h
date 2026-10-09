@@ -5,16 +5,20 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 
+#include <QImage>
 #include <QObject>
 #include <QPoint>
+#include <QRect>
 #include <QRegion>
 #include <QSize>
+#include <QVector>
 
-#include <PipeWireEncodedStream>
-#include <PipeWireSourceStream>
 #include <freerdp/server/rdpgfx.h>
 
+#include "SurfaceLayout.h"
+#include "VideoCodecSupport.h"
 #include "VideoFrame.h"
 #include "krdp_export.h"
 
@@ -43,21 +47,12 @@ class KRDP_EXPORT VideoStream : public QObject
     Q_OBJECT
 
 public:
-    enum class EncodingMode {
-        H264,
-        Progressive,
-    };
-
     explicit VideoStream(RdpConnection *session);
     ~VideoStream() override;
-
-    static bool h264Disabled();
 
     bool initialize();
     void close();
     Q_SIGNAL void closed();
-    Q_SIGNAL void sizeChanged(const QSize &size);
-    Q_SIGNAL void cursorChanged(const PipeWireCursor &cursor);
 
     /**
      * Queue a frame to be sent to the client.
@@ -82,11 +77,92 @@ public:
     bool enabled() const;
     void setEnabled(bool enabled);
     Q_SIGNAL void enabledChanged();
-    void setStreamingEnabled(bool enabled);
-    void setVideoQuality(quint8 quality);
-    void setPipeWireSource(quint32 nodeId, int fd = -1);
 
-    bool openChannel();
+    uint32_t requestedFrameRate() const;
+    Q_SIGNAL void requestedFrameRateChanged();
+
+    /**
+     * Give the stream an explicit monitor layout, one RDPGFX surface per
+     * monitor.
+     *
+     * \a layout is in any coordinate space whose monitors are laid out
+     * relative to each other; SurfaceLayout::fromMonitors() translates it into
+     * RDP desktop space, anchored at the monitors' bounding union so that no
+     * origin is negative. Entry \a i is the surface that frames with
+     * `VideoFrame::monitorIndex == i` are sent to.
+     *
+     * A layout with an empty geometry, with more than 16 monitors, or without
+     * exactly one primary is rejected and the previous layout kept: a session
+     * can briefly report a null output geometry while KWin re-adds its outputs
+     * after a DPMS wake, and tearing the surfaces down over that is worse than
+     * streaming a stale layout for a frame or two.
+     *
+     * An empty layout (the default) means "derive it from the frames", which
+     * is the single-surface behaviour every mode but `MonitorMode=multi` uses.
+     */
+    void setMonitorLayout(const QVector<VideoMonitor> &layout);
+
+    /**
+     * Emitted (from the frame submission thread) when the RDPGFX surface for
+     * \a monitorIndex was just (re)created but the frame being sent is not a
+     * keyframe, so the client has no reference picture until the next IDR. The
+     * session feeding that surface should obtain a fresh keyframe from the
+     * encoder.
+     */
+    Q_SIGNAL void keyFrameRequested(int monitorIndex);
+
+    /**
+     * A ResetGraphics (with its surfaces) has just gone out for \a monitors,
+     * in RDP desktop space. Emitted from the frame submission thread;
+     * connect with Qt::QueuedConnection. What a `KRDPCTL` `layout` record
+     * waits for, so the client never reads a layout the wire has not
+     * described yet (OPT-044).
+     */
+    Q_SIGNAL void graphicsReset(const QVector<KRdp::VideoMonitor> &monitors);
+
+    /**
+     * Set the upper bound for the video quality.
+     *
+     * With adaptive quality enabled this is a cap on the value the stream
+     * steers towards; with it disabled this is the quality used outright.
+     */
+    void setQualityCap(quint8 cap);
+    /**
+     * Enable or disable steering quality from measured goodput and RTT.
+     *
+     * When disabled the stream uses the configured quality cap outright.
+     */
+    void setAdaptiveQuality(bool enabled);
+    /**
+     * Emitted when the stream wants the session to use a new video quality,
+     * either because adaptive quality moved it or because the cap/adaptive
+     * setting changed. May be emitted from a thread other than the session's.
+     */
+    Q_SIGNAL void requestedQualityChanged(quint8 quality);
+
+    /**
+     * Set which codec family the client should be offered. Call before caps
+     * are advertised (main thread only); a change does not affect a
+     * connection that has already negotiated.
+     */
+    void setCodecPreference(CodecPreference preference);
+    CodecPreference codecPreference() const;
+    /**
+     * The codec chosen in onCapsAdvertise() from this preference and the
+     * client's caps. nullopt until the client has advertised its caps.
+     * May be read from any thread.
+     */
+    std::optional<VideoCodec> negotiatedCodec() const;
+    /**
+     * negotiatedCodec(), or the codec sessions are built for before caps are
+     * known (VideoCodecSupport::expectedCodec(codecPreference())).
+     */
+    VideoCodec codecForSessions() const;
+    /**
+     * Emitted when the negotiated codec changes, from the FreeRDP peer
+     * thread (onCapsAdvertise); connect with Qt::QueuedConnection.
+     */
+    Q_SIGNAL void negotiatedCodecChanged(KRdp::VideoCodec codec);
 
 private:
     friend BOOL gfxChannelIdAssigned(RdpgfxServerContext *, uint32_t);
@@ -97,17 +173,28 @@ private:
     uint32_t onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdvertise);
     uint32_t onFrameAcknowledge(const RDPGFX_FRAME_ACKNOWLEDGE_PDU *frameAcknowledge);
 
-    void onPacketReceived(const PipeWireEncodedStream::Packet &data);
-    void onFrameReceived(const PipeWireFrame &frame);
-    void setActiveEncodingMode(EncodingMode mode);
-    void destroySurface();
-    void performReset(QSize size);
-    bool hasInFlightCapacity() const;
-    void sendFrame(const VideoFrame &frame);
-    void sendFrameH264(const VideoFrame &frame);
-    void sendFrameProgressive(const VideoFrame &frame);
+    // Driven by the main-thread adaptive timer, which fires every
+    // QualityUpdateInterval while streaming (started in initialize(), stopped
+    // in close()); this slot therefore runs on VideoStream's own (main) thread.
+    Q_SLOT void updateAdaptiveQuality();
 
-    void updateRequestedFrameRate();
+    /**
+     * Send ResetGraphics for \a monitors (already in RDP desktop space, with
+     * the desktop itself \a desktopSize) and re-create one surface per entry
+     * of \a surfaces.
+     *
+     * Call with the private layout mutex held; it publishes the new surface
+     * vector. Returns false when the client refused to create a surface, in
+     * which case no surfaces are left behind and a reset is re-armed for the
+     * next frame.
+     */
+    bool performReset(const QSize &desktopSize, const QVector<VideoMonitor> &monitors, const QVector<SurfaceLayout::Entry> &surfaces);
+    /**
+     * Returns false only when the frame could not be sent because the GFX
+     * channel is not ready (context gone or caps reset mid-flight); the caller
+     * then keeps the frame at the head of the queue instead of dropping it.
+     */
+    bool sendFrame(const VideoFrame &frame);
 
     class Private;
     const std::unique_ptr<Private> d;

@@ -18,11 +18,14 @@ target_sources(KRdp PRIVATE
     AbstractSession.cpp
     Clipboard.cpp
     Clipboard.h
+    ClipboardText.h
     RdpConnection.cpp
     Server.cpp
     Server.h
     InputHandler.cpp
     InputHandler.h
+    LayoutControl.cpp
+    LayoutControl.h
     PeerContext.cpp
     PeerContext_p.h
     PortalSession.cpp
