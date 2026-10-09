@@ -1,75 +1,79 @@
-# KDE upstream compatibility candidate — 2026-10-09
+# KDE upstream merge and local RDP integration — 2026-10-09
 
-This checkout was cloned directly from https://invent.kde.org/plasma/krdp.git.
-Branch `port/6.7.5-custom` starts at official tag `v6.7.5`, commit
-`270dcf01851229134f74fa7d90ac338ec788ec67`. The custom port is an uncommitted
-patch on that base; it does not merge the westers fork's history into the branch.
-Trial deployment now uses `/home/niposch/.local/libexec/krdp-upstream-6.7.5-20261009`.
-The preserved `krdp-westers` checkout/runtime is the rollback installation.
+The maintained branch is `virtual-stock-kpipewire` in
+`/home/niposch/Development/krdp-westers`. Official KDE KRDP `v6.7.5`
+(`270dcf01851229134f74fa7d90ac338ec788ec67`) is merged into our existing history.
+The temporary KDE-based `port/6.7.5-custom` branch was the tested integration
+vehicle; it does not replace the original maintained branch.
 
-## Retained behavior
+## Preserved custom behavior
 
-- One capture/encoder/surface per monitor, client-shaped virtual outputs,
-  replace/extend policy, layout ownership/reconciliation, physical-display
-  snapshots/recovery, local takeover and the optional KRDPCTL channel.
-- Monitor-aware input/pointer mapping and high-resolution/zero-position wheel
-  handling; clipboard Unicode/newline conversion and echo guards.
-- Text-only clipboard snapshots deployed October 8, H264 profile/VAAPI driver
-  selection, AVC codec negotiation and optional adaptive quality.
-- Existing custom settings and 12 pure-logic regression suites, plus upstream's
-  settings-page smoke test; example servers/control probe build as well.
+- One capture/encoder/surface per monitor, client-sized virtual outputs,
+  replace/extend policy, physical-output snapshots and restore, local takeover,
+  layout ownership/reconciliation and optional KRDPCTL control.
+- Existing monitor-aware pointer mapping, cursor metadata, wheel handling,
+  stream recovery, VAAPI/profile choice and optional adaptive quality.
+- Clipboard Unicode/newline handling, ownership, main-thread delivery,
+  client-echo and multi-monitor announcement guards. Text snapshots avoid the
+  eager image reads that caused the October 8 freeze.
+- Custom settings, examples, layout/input/recovery tests and fork documentation.
 
-## Compatible upstream fixes retained or reapplied
+## Upstream integration
 
-- Official stable version/dependency declarations, translations, settings
-  metadata and default logging severity. KF6 GlobalAccel and QtTest are added
-  only for the retained shortcut/test functionality.
-- `231bec4`: close the peer in every connection state before joining its thread.
-- `125d8de`: free the peer context before freeing the peer, fixing connection
-  file-descriptor/thread leaks.
-- `9395b1c`: set KAboutData's correct desktop-file name (the fork already set the
-  QApplication value, which KAboutData then overwrote).
-- `5976316`: guard portal teardown when setup never created a session.
-- Portal cursor metadata request; upstream private Wayland code generation.
-- `4eb3dff` from KDE master: disable extended security for this candidate's
-  existing TLS/PAM authentication path so FreeRDP 3.32 cannot bypass it.
-- Clipboard MIME fix, fake-input authentication, main-thread input delivery,
-  GFX capability re-advertisement handling and queue/surface locking already
-  have equivalent custom implementations, which are preserved.
+Stable version/dependency declarations, translations, settings metadata,
+peer shutdown/context cleanup, portal app-ID/teardown/cursor fixes and Wayland
+private code generation are retained. Compatible KDE master `4eb3dff` disables
+extended security for the existing TLS/PAM authentication path with FreeRDP 3.32.
+The stable desktop and FreeRDP 3.31.1 packages remain in use.
 
-## Architectural difference that remains
+Upstream encoder ownership and progressive encoding are adapted to multiple
+monitors through `CaptureStream`: server capture pipelines belong to
+`VideoStream`, while session backends retain their capture/recovery/input
+facade. Standalone capture examples own their own pipeline. Encoders wait for
+codec negotiation before starting. Each progressive surface has independent
+codec state, full initialization after reset, monitor-specific queued damage
+coalescing and bounded in-flight frames. H.264 keeps ordered P-frame chains and
+monitor-specific keyframe clearing. Caps re-advertisement keeps our surface
+locking and recovery behavior.
 
-This is a compatibility port, not a completed rewrite on upstream's new video
-pipeline. Upstream 6.7 moved encoder ownership from AbstractSession to
-VideoStream and added progressive encoding. The custom per-monitor sessions,
-monitor-keyed frame queue, surfaces and display-readiness checks remain on the
-custom H264 path. Consequently this candidate does not provide upstream's
-progressive-codec fallback or every later VideoStream implementation change.
-A genuine convergence must move those custom features onto upstream's encoder
-ownership/surface interfaces and rerun authenticated Windows two-monitor,
-clipboard, local takeover and suspend/resume checks. Current master (6.8.80)
-also changes input to libei and requires libei >=1.6; libei-devel is not installed
-on this workstation. Plasma 6.8 is still a beta as of this investigation.
+This is an integration of upstream behavior, not an identical copy of its
+single-monitor VideoStream. Auto uses H.264 AVC420 when available and
+progressive otherwise. `Codec=progressive` or `KRDP_NO_H264=1` forces progressive.
+Stock KPipeWire has no dual-stream AVC444 encoder: misleading AVC444 advertising
+and logging are corrected. The existing AVC444 preference is retained but
+falls back to AVC420 with this encoder; capability helpers remain for a future
+true AVC444 implementation.
 
-## Verification and deployment status
+## Color and clipboard findings
 
-Full RelWithDebInfo build, all examples and settings module succeeded against
-stock Fedora KPipeWire 6.7.5, Qt 6.11.2, KF6 6.30 and FreeRDP 3.31.1.
-All 14 CTest entries pass with host D-Bus, offscreen/software rendering and
-isolated settings; appstreamtest skips because no install was performed, so
-13 entries execute functional checks. Both clipboard snapshot handlers pass
-image-only/mixed-offer regression checks with the old fork HEAD as the negative
-control. Twenty-five loopback-only TLS connections leave FD/thread counts at
-10/2 before and after; termination succeeds within eight seconds (exit 0).
-No credentials are sent and no authenticated capture session is exercised.
-The first sandboxed KCM test hung; the isolated host-side run passes. Test
-processes were cleaned up. Trial activation on October 9 at 09:41:23 CEST replaced the live server.
-The user confirmed both Windows RDP screens and pointer crossing work.
-Capture at 1920x1080 and 3440x1440 runs on automatic error-free PipeWire links.
-Repeated real screenshot/text copies, local takeover and natural resume remain
-to be checked; this does not complete integration of upstream's encoder pipeline.
+The Spotify Flatpak icon uses RGB (30,215,96). The Intel VAAPI default conversion
+reproduces a reduction to (28,180,97); explicit BT.709 matrix/primaries/transfer
+and full-range encoding recover approximately (31,215,98). The private
+KPipeWireRecord patch under `patches/` corrects the full-range hardware and
+software encoder paths, including encoded color metadata. Its Limited recording
+path remains unchanged. Build the patch against official KPipeWire v6.7.5;
+only KRDP's private runtime should load this library, preserving desktop packages.
 
-Reproduction, dependency transaction, staged artifacts and the remaining
-activation/convergence work are recorded in
-`/home/niposch/Administration/docs/krdp-upstream-migration.md` and
-`/home/niposch/Administration/scripts/krdp-upstream-port/README.md`.
+Text copying both ways was confirmed by the user. Images are unimplemented
+in our branch and upstream, rather than a failed redirection setting. Adding
+PNG/CF_DIB transfer requires deferred requested-format reads, bounded conversion,
+ownership/generation handling and image echo guards. Do not fetch every advertised
+Wayland payload from a clipboard-change handler.
+
+## Validation and operation
+
+All 15 CTest entries pass (14 functional checks; appstream skips before install),
+including non-tile-aligned progressive codec round trips and monitor-specific
+damage preservation. Clipboard snapshot negative/positive regression checks pass.
+A synthetic loopback RDP server and FreeRDP client on an isolated X display decode
+both monitor surfaces correctly through progressive and Intel-encoded AVC420;
+progressive also initializes both surfaces from partial first-frame damage.
+These tests never capture the desktop or use system login/clipboard data.
+
+Exact runtime activation, binary hashes, Windows validation limits, backup and
+rollback are recorded in
+`/home/niposch/Administration/docs/krdp-color-codecs-and-merge.md`.
+The prior 09:41 trial confirmed two Windows screens and pointer movement.
+Post-merge Windows color/capture, local takeover and natural resume still need
+checking. No beta Plasma/input dependency is adopted; KDE master additionally
+requires libei >=1.6 and needs a separate future migration.

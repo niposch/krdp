@@ -9,6 +9,7 @@
 #include <PipeWireEncodedStream>
 #include <PipeWireSourceStream>
 #include <QSet>
+#include <QPointer>
 
 #include "krdp_logging.h"
 
@@ -18,7 +19,7 @@ namespace KRdp
 class KRDP_NO_EXPORT AbstractSession::Private
 {
 public:
-    std::unique_ptr<PipeWireEncodedStream> encodedStream;
+    QPointer<CaptureStream> encodedStream;
 
     std::optional<int> activeStream;
     std::optional<VirtualMonitor> virtualMonitor;
@@ -42,6 +43,7 @@ AbstractSession::~AbstractSession()
 {
     if (d->encodedStream) {
         d->encodedStream->stop();
+        delete d->encodedStream;
     }
 }
 
@@ -197,11 +199,11 @@ QSize AbstractSession::size() const
     return pixelSize();
 }
 
-PipeWireEncodedStream *AbstractSession::stream()
+CaptureStream *AbstractSession::stream()
 {
     if (!d->encodedStream) {
-        d->encodedStream = std::make_unique<PipeWireEncodedStream>();
-        connect(d->encodedStream.get(), &PipeWireEncodedStream::activeChanged, this, &AbstractSession::streamActiveChanged);
+        d->encodedStream = new CaptureStream(this);
+        connect(d->encodedStream, &CaptureStream::activeChanged, this, &AbstractSession::streamActiveChanged);
         if (d->frameRate) {
             d->encodedStream->setMaxFramerate({d->frameRate.value(), 1});
         }
@@ -209,7 +211,20 @@ PipeWireEncodedStream *AbstractSession::stream()
             d->encodedStream->setQuality(d->quality.value());
         }
     }
-    return d->encodedStream.get();
+    return d->encodedStream;
+}
+
+void AbstractSession::bindVideoStream(QObject *owner, bool progressive, bool ready)
+{
+    stream()->setParent(owner);
+    stream()->setReady(ready);
+    stream()->setProgressive(progressive);
+}
+
+void AbstractSession::setProgressive(bool progressive)
+{
+    stream()->setProgressive(progressive);
+    stream()->setReady(true);
 }
 
 void AbstractSession::setStarted(bool s)

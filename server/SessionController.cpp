@@ -412,6 +412,10 @@ public:
         const bool multi = !layout.isEmpty();
         for (const auto &entry : sessions) {
             auto *session = entry.get();
+            session->bindVideoStream(videoStream, videoStream->codecForSessions() == KRdp::VideoCodec::Progressive, videoStream->negotiatedCodec().has_value());
+            m_sessionConnections.append(connect(videoStream, &KRdp::VideoStream::negotiatedCodecChanged, session, [session](KRdp::VideoCodec codec) {
+                session->setProgressive(codec == KRdp::VideoCodec::Progressive);
+            }, Qt::QueuedConnection));
             m_sessionConnections.append(connect(session, &KRdp::AbstractSession::frameReceived, videoStream, &KRdp::VideoStream::queueFrame));
             // The session is passed along: a cursor sample's position is
             // local to the output that session captures (see onCursorUpdate()).

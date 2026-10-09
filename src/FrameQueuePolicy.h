@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: LGPL-2.1-only OR LGPL-3.0-only OR LicenseRef-KDE-Accepted-LGPL
 
 #pragma once
+#include <utility>
 
 namespace KRdp
 {
@@ -52,6 +53,18 @@ void dropSupersededFrames(Queue &queue, int keyframeMonitorIndex)
     queue.removeIf([keyframeMonitorIndex](const auto &queued) {
         return supersededByKeyframe(queued.monitorIndex, keyframeMonitorIndex);
     });
+}
+
+// Raster snapshots have no reference chain. Keep the latest image for this
+// monitor, but retain all damage since its last transmitted image.
+template<class Queue, class Frame>
+void coalesceRasterFrame(Queue &queue, Frame frame)
+{
+    for (const auto &queued : queue) {
+        if (queued.monitorIndex == frame.monitorIndex) frame.damage += queued.damage;
+    }
+    dropSupersededFrames(queue, frame.monitorIndex);
+    queue.append(std::move(frame));
 }
 
 }

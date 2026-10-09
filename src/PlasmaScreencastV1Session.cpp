@@ -691,9 +691,19 @@ void PlasmaScreencastV1Session::attachEncodedStream(uint nodeId, bool streamWasA
     }
 
     if (!d->streamSignalsConnected) {
-        connect(encodedStream, &PipeWireEncodedStream::newPacket, this, &PlasmaScreencastV1Session::onPacketReceived);
-        connect(encodedStream, &PipeWireEncodedStream::sizeChanged, this, &PlasmaScreencastV1Session::setSize);
-        connect(encodedStream, &PipeWireEncodedStream::cursorChanged, this, &PlasmaScreencastV1Session::cursorUpdate);
+        connect(encodedStream, &CaptureStream::newPacket, this, &PlasmaScreencastV1Session::onPacketReceived);
+        connect(encodedStream, &CaptureStream::sizeChanged, this, &PlasmaScreencastV1Session::setSize);
+        connect(encodedStream, &CaptureStream::cursorChanged, this, &PlasmaScreencastV1Session::cursorUpdate);
+        connect(encodedStream, &CaptureStream::rasterFrame, this, [this](const QImage &image, const QRegion &damage) {
+            VideoFrame frame;
+            frame.size = image.size();
+            frame.image = image;
+            frame.damage = damage;
+            frame.isKeyFrame = true;
+            frame.monitorIndex = monitorIndex();
+            frame.monitors = d->monitorLayout;
+            Q_EMIT frameReceived(frame);
+        });
         d->streamSignalsConnected = true;
     }
 

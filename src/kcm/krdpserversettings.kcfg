@@ -33,7 +33,7 @@ SPDX-License-Identifier: BSD-2-Clause
       <default>true</default>
     </entry>
     <entry name="Codec" type="String">
-      <label>Video codec: auto (AVC444v2/AVC444 when the client supports it, else AVC420), avc420 (always), avc444 (auto, warning when the client cannot)</label>
+      <label>Video codec: auto (H.264 AVC420, progressive fallback), avc420, avc444 (requires a dual-stream encoder; falls back to AVC420 with stock KPipeWire), progressive</label>
       <default>auto</default>
     </entry>
     <entry name="MonitorMode" type="String">

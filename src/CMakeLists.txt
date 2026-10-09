@@ -15,6 +15,8 @@ if (BUILD_PLASMA_SESSION)
 endif()
 
 target_sources(KRdp PRIVATE
+    CaptureStream.cpp
+    CaptureStream.h
     AbstractSession.cpp
     Clipboard.cpp
     Clipboard.h

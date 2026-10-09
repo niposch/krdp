@@ -409,9 +409,19 @@ void KRdp::PortalSession::onSessionStarted(uint code, const QVariantMap &result)
             // Ensure we encode in full color range when the KPipeWire API supports it.
             setFullColorRangeIfSupported(encodedStream);
             setPreferredH264Encoder(encodedStream);
-            connect(encodedStream, &PipeWireEncodedStream::newPacket, this, &PortalSession::onPacketReceived);
-            connect(encodedStream, &PipeWireEncodedStream::sizeChanged, this, &PortalSession::setSize);
-            connect(encodedStream, &PipeWireEncodedStream::cursorChanged, this, &PortalSession::cursorUpdate);
+            connect(encodedStream, &CaptureStream::newPacket, this, &PortalSession::onPacketReceived);
+            connect(encodedStream, &CaptureStream::sizeChanged, this, &PortalSession::setSize);
+            connect(encodedStream, &CaptureStream::cursorChanged, this, &PortalSession::cursorUpdate);
+        connect(encodedStream, &CaptureStream::rasterFrame, this, [this](const QImage &image, const QRegion &damage) {
+            VideoFrame frame;
+            frame.size = image.size();
+            frame.image = image;
+            frame.damage = damage;
+            frame.isKeyFrame = true;
+            frame.monitorIndex = monitorIndex();
+            frame.monitors = d->monitorLayout;
+            Q_EMIT frameReceived(frame);
+        });
             QDBusConnection::sessionBus().connect(u"org.freedesktop.portal.Desktop"_s,
                                                   d->sessionPath.path(),
                                                   u"org.freedesktop.portal.Session"_s,

@@ -16,6 +16,7 @@
 #include <QVector>
 
 #include <freerdp/server/rdpgfx.h>
+#include <freerdp/codec/progressive.h>
 
 #include "SurfaceLayout.h"
 #include "VideoCodecSupport.h"
@@ -195,6 +196,7 @@ private:
      * then keeps the frame at the head of the queue instead of dropping it.
      */
     bool sendFrame(const VideoFrame &frame);
+    bool sendRasterFrame(const VideoFrame &frame, uint16_t surfaceId, const std::shared_ptr<PROGRESSIVE_CONTEXT> &context, bool fullFrame);
 
     class Private;
     const std::unique_ptr<Private> d;
